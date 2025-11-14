@@ -1,0 +1,12 @@
+{
+  "streamers": [
+    {
+      "username": "example_streamer",
+      "running": false,
+      "threshold": 30.0,
+      "menu_items": [],
+      "selected_menu_items": []
+    }
+  ]
+}
+
