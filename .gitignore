@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 项目特定
+# streamers.json 可能包含敏感配置，建议不提交或使用模板
+# streamers.json
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+*.bak
+
