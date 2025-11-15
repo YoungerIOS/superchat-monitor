@@ -11,7 +11,12 @@
 - 📊 **实时状态显示**：显示主播在线状态、打赏信息等
 - 🔄 **自动排序**：直播中的主播自动排在前面
 
+### 监控面板
 ![监控面板截图](screenshot.png)
+
+### 选择要监控的打赏菜单项
+![监控面板截图](screenshot2.png)
+
 
 ## 技术栈
 
@@ -29,9 +34,8 @@ python -m playwright install chromium
 
 ## 配置
 
-1. 编辑 `streamers.json` 配置主播列表
-2. 在 `monitor_tip.py` 中配置代理（如需要）
-3. 运行程序：`python monitor_tip.py`
+1. 在 `monitor_tip.py` 中配置代理PROXY（如需要）
+2. 运行程序：`python monitor_tip.py`
 
 ## 使用说明
 
@@ -44,7 +48,6 @@ python -m playwright install chromium
 
 ## 注意事项
 
-- `streamers.json` 包含主播配置信息，建议不提交到版本控制
-- 需要配置代理才能访问目标网站
+- 在某些国家需要配置代理才能访问目标网站
 - 首次运行需要授权浏览器通知权限
 
