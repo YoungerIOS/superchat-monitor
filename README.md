@@ -1,6 +1,6 @@
 # SuperChat 监控面板
 
-一个用于监控 SuperChat 直播平台的主播打赏、菜单打赏和目标达成事件的实时监控系统。
+一个用于监控 Stripchat/Superchat 直播平台的直播间小费打赏、菜单打赏和目标达成事件的实时监控系统。
 
 ## 功能特性
 
@@ -32,7 +32,7 @@ pip install playwright aiohttp aiohttp-socks requests nicegui
 python -m playwright install chromium
 ```
 
-## 配置
+## 配置和运行
 
 1. 在 `monitor_tip.py` 中配置代理PROXY（如需要）
 2. 运行程序：`python monitor_tip.py`
@@ -41,9 +41,10 @@ python -m playwright install chromium
 
 1. 启动程序后，访问 `http://localhost:8080` 打开监控面板
 2. 在面板中可以：
+   - 添加/删除主播
    - 查看所有主播的实时状态
-   - 配置每个主播的打赏阈值
-   - 选择要监控的菜单项
+   - 配置每个主播的打赏金额提醒阈值
+   - 选择要监控的打赏菜单项
    - 开启/关闭监控
 
 ## 注意事项
