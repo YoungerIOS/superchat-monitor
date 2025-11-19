@@ -332,8 +332,11 @@ def fetch_page_uniq_and_cookies(username: str, headless: bool = True, nav_timeou
 # ---------- 从DOM元素结构提取菜单信息（使用Playwright） ----------
 def extract_menu_from_dom(username: str, headless: bool = True, nav_timeout: int = 30000) -> Dict[str, Any]:
     """
-    使用 Playwright 从DOM元素结构中提取完整的小费菜单
-    定位到table元素并提取所有菜单项
+    使用 Playwright 提取主播的小费菜单。
+    步骤：
+      1. 打开页面并尝试触发“完整菜单/小费选单”入口；
+      2. 首先尝试旧版 table 结构；
+      3. 如无 table，再扫描包含“代币/token”关键词的卡片式 DOM 列表。
     """
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
     home = f"https://zh.superchat.live/{username}"
@@ -365,201 +368,207 @@ def extract_menu_from_dom(username: str, headless: bool = True, nav_timeout: int
                 page.wait_for_load_state("networkidle", timeout=10000)
             except:
                 pass
-            
-            # 等待一下，让页面完全加载
-            page.wait_for_timeout(3000)
-            
-            # 尝试点击"完整小费菜单"按钮以展开完整菜单
+            page.wait_for_timeout(2000)
+
+            def _click_by_keywords(keywords, description: str) -> bool:
+                for text in keywords:
+                    try:
+                        locator = page.get_by_text(text, exact=False)
+                        if locator.count() > 0:
+                            target = locator.first
+                            target.scroll_into_view_if_needed()
+                            target.click()
+                            print(f"[{username}] 已点击 {description}: {text}")
+                            return True
+                    except Exception:
+                        continue
+                return False
+
+            def _click_by_selector(selector: str, description: str) -> bool:
+                try:
+                    locator = page.locator(selector)
+                    if locator.count() > 0:
+                        locator.first.scroll_into_view_if_needed()
+                        locator.first.click()
+                        print(f"[{username}] 已通过选择器点击 {description}: {selector}")
+                        return True
+                except Exception as e:
+                    print(f"[{username}] 选择器 {selector} 点击失败: {e}")
+                return False
+
+            # 尝试展开“完整小费菜单”按钮
             try:
-                # 查找"完整小费菜单"按钮
-                full_menu_button = page.evaluate("""
-                    () => {
-                        let buttons = document.querySelectorAll('button, [role="button"], a[class*="button"]');
-                        for (let btn of buttons) {
-                            let text = (btn.textContent || btn.innerText || btn.getAttribute('aria-label') || '').toLowerCase();
-                            if (text.includes('完整') || text.includes('full') || text.includes('完整菜单') || text.includes('full menu')) {
-                                return true; // 找到按钮
-                            }
-                        }
-                        return false;
-                    }
-                """)
-                
-                if full_menu_button:
-                    # 点击按钮
-                    page.evaluate("""
-                        () => {
-                            let buttons = document.querySelectorAll('button, [role="button"], a[class*="button"]');
-                            for (let btn of buttons) {
-                                let text = (btn.textContent || btn.innerText || btn.getAttribute('aria-label') || '').toLowerCase();
-                                if (text.includes('完整') || text.includes('full') || text.includes('完整菜单') || text.includes('full menu')) {
-                                    btn.click();
-                                    return true;
-                                }
-                            }
-                            return false;
-                        }
-                    """)
-                    
-                    print(f"[{username}] 已点击完整菜单按钮，等待菜单展开...")
-                    # 等待菜单展开
+                full_menu_clicked = _click_by_keywords(
+                    ["完整小费菜单", "完整菜单", "完整", "Full menu", "Full tip menu", "Show full"],
+                    "完整菜单按钮"
+                )
+                if full_menu_clicked:
                     page.wait_for_timeout(3000)
-                    
-                    # 等待可能的网络请求完成
                     try:
                         page.wait_for_load_state("networkidle", timeout=5000)
                     except:
                         pass
-                    
-                    # 再等待一下，确保菜单完全展开
-                    page.wait_for_timeout(2000)
+                    page.wait_for_timeout(1500)
             except Exception as e:
-                print(f"[{username}] 查找/点击完整菜单按钮时出错: {e}")
-            
-            # 从table元素中提取菜单项
+                print(f"[{username}] 点击完整菜单按钮时出错: {e}")
+
+            # 点击“发送小费”按钮（可直接唤起菜单抽屉）
             try:
-                menu_data = page.evaluate("""
+                # 若存在遮罩(如访客协议)，先尝试关闭
+                def close_overlays():
+                    selectors = [
+                        "div.full-cover.modal-wrapper button",
+                        "div#agreement-root button",
+                        "button:has-text('接受')",
+                        "button:has-text('同意')",
+                        "button:has-text('Accept')"
+                    ]
+                    for sel in selectors:
+                        try:
+                            overlay_btn = page.locator(sel)
+                            if overlay_btn.count() > 0:
+                                overlay_btn.first.click()
+                                page.wait_for_timeout(500)
+                        except Exception:
+                            continue
+
+                close_overlays()
+
+                send_tip_clicked = _click_by_keywords(
+                    ["发送小费", "Send tip", "Send Tip"],
+                    "发送小费按钮"
+                )
+                if not send_tip_clicked:
+                    send_tip_clicked = _click_by_selector(
+                        'button.send-tip-btn, button:has-text("发送小费"), button:has-text("Send tip")',
+                        "发送小费按钮"
+                    )
+                if not send_tip_clicked:
+                    close_overlays()
+                    send_tip_clicked = _click_by_selector(
+                        'button.send-tip-btn, button:has-text("发送小费"), button:has-text("Send tip")',
+                        "发送小费按钮"
+                    )
+                if send_tip_clicked:
+                    page.wait_for_timeout(2000)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=5000)
+                    except:
+                        pass
+                    page.wait_for_timeout(1000)
+            except Exception as e:
+                print(f"[{username}] 点击发送小费按钮失败: {e}")
+
+            # 点击“小费选单”选项卡
+            try:
+                tip_tab_clicked = _click_by_keywords(
+                    ["小费选单", "小费菜单", "Tip menu", "Tip Menu", "TIP MENU"],
+                    "小费选单标签"
+                )
+                if tip_tab_clicked:
+                    page.wait_for_timeout(2000)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=5000)
+                    except:
+                        pass
+                    page.wait_for_timeout(1000)
+            except Exception as e:
+                print(f"[{username}] 点击小费选单标签失败: {e}")
+            
+            # 从 DOM 中提取菜单项（优先 table，其次卡片式列表）
+            try:
+                menu_data = page.evaluate(r"""
                     () => {
-                        let menuItems = [];
-                        
-                        // 方式1: 使用提供的XPath路径定位table
-                        // 转换为CSS选择器：从路径 /html/body/div[3]/div[2]/div/main/div/div[4]/div/div/div/div[2]/div/div[2]/div[1]/div[2]/div/div[2]/div/div[2]/div[2]/div/table
-                        // 尝试多种方式定位table
-                        let table = null;
-                        
-                        // 方式1: 直接查找table元素（在可能的菜单容器中）
-                        let tables = document.querySelectorAll('table');
-                        for (let t of tables) {
-                            // 检查table是否包含菜单相关的文本或结构
-                            let text = t.textContent || '';
-                            if (text.includes('代币') || text.includes('token') || t.querySelectorAll('tr').length > 0) {
-                                table = t;
-                                break;
-                            }
-                        }
-                        
-                        // 方式2: 如果没找到，尝试从body开始按路径查找
-                        if (!table) {
-                            try {
-                                let body = document.body;
-                                if (body && body.children.length > 2) {
-                                    let div3 = body.children[2]; // div[3] (索引从0开始，所以是2)
-                                    if (div3 && div3.children.length > 1) {
-                                        let div2 = div3.children[1]; // div[2]
-                                        // 继续向下查找...
-                                        // 由于路径较深，我们尝试递归查找
-                                        function findTable(element, depth) {
-                                            if (depth > 15) return null; // 防止过深
-                                            if (element.tagName === 'TABLE') {
-                                                return element;
-                                            }
-                                            for (let child of element.children || []) {
-                                                let result = findTable(child, depth + 1);
-                                                if (result) return result;
-                                            }
-                                            return null;
-                                        }
-                                        table = findTable(div3, 0);
+                        const menuItems = [];
+                        const seen = new Set();
+                        const STOP_WORDS = ['目标', '总共支付', '已支付', '支付', '进度', 'goal', 'target', 'total', 'paid', 'progress'];
+
+                        const pushItem = (activity, price, source = 'unknown', fullText = '') => {
+                            if (!activity || !price) return;
+                            activity = activity.replace(/\s+/g, ' ').trim();
+                            const priceNum = (price.match(/(\d+)/) || [null, ''])[1];
+                            if (!activity || !priceNum) return;
+                            const activityLower = activity.toLowerCase();
+                            if (STOP_WORDS.some(w => activityLower.includes(w))) return;
+                            const key = `${activity}|${priceNum}`;
+                            if (seen.has(key)) return;
+                            seen.add(key);
+                            menuItems.push({
+                                activity,
+                                price: priceNum,
+                                text: activity,
+                                raw: { activity, price: priceNum, fullText, source }
+                            });
+                        };
+
+                        const tableSelectors = [
+                            'div.ModelChatActionsSectionsWithScroll__section_tipMenu table',
+                            'div.ModelChatActionsSectionsWithScroll__section table',
+                            'table'
+                        ];
+
+                        const extractFromTables = () => {
+                            for (const selector of tableSelectors) {
+                                const tables = Array.from(document.querySelectorAll(selector));
+                                for (const table of tables) {
+                                    const rows = table.querySelectorAll('tr.tip-menu-item, tr');
+                                    if (!rows.length) continue;
+                                    for (const row of rows) {
+                                        const activityCell = row.querySelector('.tip-menu-item-activity-cell, td:nth-child(1), td');
+                                        const priceCell = row.querySelector('.tip-menu-item-price-cell, td:nth-child(2), td + td');
+                                        if (!activityCell || !priceCell) continue;
+                                        const activity = (activityCell.textContent || '').trim();
+                                        const price = (priceCell.textContent || '').trim();
+                                        pushItem(activity, price, 'table', row.textContent || '');
                                     }
                                 }
-                            } catch(e) {}
-                        }
-                        
-                        // 方式3: 查找所有包含"代币"或菜单特征的table
-                        if (!table) {
-                            let allTables = document.querySelectorAll('table');
-                            for (let t of allTables) {
-                                let rows = t.querySelectorAll('tr');
-                                if (rows.length > 0) {
-                                    // 检查第一行是否包含菜单特征
-                                    let firstRowText = rows[0].textContent || '';
-                                    if (firstRowText.includes('代币') || firstRowText.includes('token') || 
-                                        firstRowText.includes('$') || /\\d+/.test(firstRowText)) {
-                                        table = t;
-                                        break;
-                                    }
-                                }
+                                if (menuItems.length) return;
                             }
-                        }
-                        
-                        if (table) {
-                            let rows = table.querySelectorAll('tr');
-                            console.log(`找到table，包含 ${rows.length} 行`);
-                            
-                            for (let row of rows) {
-                                let cells = row.querySelectorAll('td, th');
-                                
-                                if (cells.length >= 2) {
-                                    // 通常第一列是activity，第二列是price
-                                    let activity = (cells[0].textContent || '').trim();
-                                    let price = (cells[1].textContent || '').trim();
-                                    
-                                    // 清理activity文本（移除多余空格和换行）
-                                    activity = activity.replace(/\\s+/g, ' ').trim();
-                                    
-                                    // 从price中提取数字
-                                    let priceMatch = price.match(/(\\d+)/);
-                                    let priceNum = priceMatch ? priceMatch[1] : '';
-                                    
-                                    if (activity && activity.length > 0 && activity.length < 200) {
-                                        // 过滤掉表头等非菜单项
-                                        if (!activity.toLowerCase().includes('activity') && 
-                                            !activity.toLowerCase().includes('price') &&
-                                            activity !== '代币' &&
-                                            activity !== 'tokens' &&
-                                            !price.toLowerCase().includes('price') &&
-                                            !price.toLowerCase().includes('tokens')) {
-                                            menuItems.push({
-                                                activity: activity,
-                                                price: priceNum,
-                                                text: activity,
-                                                raw: {
-                                                    activity: activity,
-                                                    price: priceNum,
-                                                    fullText: row.textContent
-                                                }
-                                            });
-                                        }
-                                    }
-                                } else if (cells.length === 1) {
-                                    // 单列情况：可能是合并的文本
-                                    let text = (cells[0].textContent || '').trim();
-                                    // 尝试匹配格式：activity + price
-                                    let match = text.match(/^(.+?)(\\d+)\\s*代币/i);
+                        };
+
+                        const extractFromCards = () => {
+                            const keywordRegex = /(小费|选单|tip|menu|token|代币)/i;
+                            const valueRegex = /(.*?)(\d+)\s*(代币|token|tokens)/i;
+                            const containers = new Set();
+                            const selectors = [
+                                'div.ModelChatActionsSectionsWithScroll__section_tipMenu',
+                                '[class*="tip-menu"]',
+                                '[class*="tipMenu"]',
+                                '[data-test*="tip"]',
+                                '[data-testid*="tip"]',
+                                '[role="tabpanel"]',
+                                'section'
+                            ];
+                            selectors.forEach(sel => {
+                                document.querySelectorAll(sel).forEach(el => {
+                                    const text = (el.textContent || '').trim();
+                                    if (!text) return;
+                                    if (!keywordRegex.test(text)) return;
+                                    containers.add(el);
+                                });
+                            });
+
+                            containers.forEach(container => {
+                                const nodes = container.querySelectorAll('tr, li, div, p, span');
+                                nodes.forEach(node => {
+                                    const rawText = (node.innerText || node.textContent || '').trim();
+                                    if (!rawText) return;
+                                    const lowerRaw = rawText.toLowerCase();
+                                    if (STOP_WORDS.some(w => lowerRaw.includes(w))) return;
+                                    const match = rawText.match(valueRegex);
                                     if (match) {
-                                        let activity = match[1].trim().replace(/\\s+/g, ' ');
-                                        let price = match[2];
-                                        if (activity && activity.length > 0 && activity.length < 200) {
-                                            menuItems.push({
-                                                activity: activity,
-                                                price: price,
-                                                text: activity,
-                                                raw: {
-                                                    activity: activity,
-                                                    price: price,
-                                                    fullText: text
-                                                }
-                                            });
-                                        }
+                                        pushItem(match[1], match[2], 'card', rawText);
                                     }
-                                }
-                            }
-                        } else {
-                            console.log('未找到table元素');
+                                });
+                            });
+                        };
+
+                        extractFromTables();
+                        if (!menuItems.length) {
+                            extractFromCards();
                         }
-                        
-                        // 去重
-                        let uniqueItems = [];
-                        let seen = new Set();
-                        menuItems.forEach(item => {
-                            let key = item.activity + '|' + item.price;
-                            if (!seen.has(key)) {
-                                seen.add(key);
-                                uniqueItems.push(item);
-                            }
-                        });
-                        
-                        return uniqueItems;
+
+                        return menuItems;
                     }
                 """)
                 
@@ -1764,7 +1773,7 @@ def build_streamer_row(username: str):
             current_selected = set(get_streamer_selected_menu_items(username))
             
             # 创建对话框
-            with ui.dialog() as config_dialog, ui.card().style('width: 700px; max-height: 80vh; padding: 10px;'):
+            with ui.dialog() as config_dialog, ui.card().style('width: 760px; min-height: 78vh; max-height: 92vh; padding: 16px; display: flex; flex-direction: column;'):
                 ui.label('配置设置').classes('text-h6').style('font-weight: bold; margin-bottom: 4px;')
                 
                 # 阈值设置区域
@@ -1782,7 +1791,7 @@ def build_streamer_row(username: str):
                     ui.label('完整小费选单').classes('text-subtitle2').style('margin-bottom: 2px;')
                     
                     # 菜单列表容器（可滚动，去掉边框）
-                    menu_container = ui.column().classes('w-full').style('max-height: 300px; overflow-y: auto; padding: 4px;')
+                    menu_container = ui.column().classes('w-full').style('max-height: 240px; overflow-y: auto; padding: 4px;')
                     
                     # 存储菜单项复选框的字典
                     menu_checkboxes = {}
@@ -1794,31 +1803,30 @@ def build_streamer_row(username: str):
                         menu_container.clear()
                         menu_checkboxes.clear()
                         menu_items_list = menu_data if menu_data else []
-                        
-                        if not menu_items_list:
-                            ui.label('暂无菜单项，请点击"刷新菜单"获取').classes('text-gray-500 text-sm').style('padding: 4px;')
-                        else:
-                            for idx, item in enumerate(menu_items_list):
-                                # 提取菜单项文本
-                                if isinstance(item, dict):
-                                    activity = item.get("activity") or item.get("text") or ""
-                                    price = item.get("price") or ""
-                                    item_key = activity  # 使用activity作为唯一标识
-                                else:
-                                    activity = str(item)
-                                    price = ""
-                                    item_key = str(item)
-                                
-                                # 创建带复选框的行，金额显示在右侧
-                                with ui.row().classes('w-full items-center gap-2').style('margin-bottom: 1px; justify-content: space-between;'):
-                                    checkbox = ui.checkbox(
-                                        activity,
-                                        value=item_key in current_selected
-                                    ).classes('flex-1')
-                                    menu_checkboxes[item_key] = checkbox
-                                    # 金额显示在右侧
-                                    if price:
-                                        ui.label(f"{price}代币").classes('text-gray-600 text-sm').style('flex-shrink: 0; margin-left: 8px;')
+
+                        with menu_container:
+                            if not menu_items_list:
+                                ui.label('暂无菜单项，请点击"刷新菜单"获取').classes('text-gray-500 text-sm').style('padding: 4px;')
+                            else:
+                                for idx, item in enumerate(menu_items_list):
+                                    # 提取菜单项文本
+                                    if isinstance(item, dict):
+                                        activity = item.get("activity") or item.get("text") or ""
+                                        price = item.get("price") or ""
+                                        item_key = activity  # 使用activity作为唯一标识
+                                    else:
+                                        activity = str(item)
+                                        price = ""
+                                        item_key = str(item)
+
+                                    with ui.row().classes('w-full items-center gap-2').style('margin-bottom: 1px; justify-content: space-between;'):
+                                        checkbox = ui.checkbox(
+                                            activity,
+                                            value=item_key in current_selected
+                                        ).classes('flex-1')
+                                        menu_checkboxes[item_key] = checkbox
+                                        if price:
+                                            ui.label(f"{price}代币").classes('text-gray-600 text-sm').style('flex-shrink: 0; margin-left: 8px;')
                     
                     # 初始加载已保存的菜单
                     update_menu_list(current_menu_items)
@@ -1826,6 +1834,12 @@ def build_streamer_row(username: str):
                     # 刷新菜单按钮
                     with ui.row().classes('w-full gap-2').style('margin-top: 2px;'):
                         refresh_btn = ui.button('刷新菜单').classes('q-btn--no-uppercase')
+                        # 仅在主播直播中才允许刷新菜单
+                        state = ROOM_STATE.get(username) or {}
+                        can_refresh_menu = state.get("online_status") is True
+                        refresh_btn.set_enabled(can_refresh_menu)
+                        if not can_refresh_menu:
+                            refresh_btn.tooltip('主播未直播，无法刷新菜单')
                         
                         async def refresh_menu():
                             refresh_btn.props('loading')
@@ -1862,6 +1876,11 @@ def build_streamer_row(username: str):
                                     current_selected.clear()
                                     current_selected.update(new_selected)
                                     update_menu_list(menu_data)
+                                    # 立即持久化最新菜单列表，防止对话框意外关闭导致数据丢失
+                                    try:
+                                        set_streamer_menu_items(username, menu_data)
+                                    except Exception as pers_err:
+                                        print(f"[{username}] 保存菜单列表失败: {pers_err}")
                                     ui.notify(f'成功获取 {len(menu_data)} 个菜单项', type='positive')
                                 else:
                                     ui.notify('未获取到菜单项', type='warning')
