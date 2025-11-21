@@ -2337,9 +2337,10 @@ async def main():
 
 if __name__ == "__main__":
     build_ui()
+    port = int(os.getenv("PORT", "8080"))
     ui.run(
         host="0.0.0.0",
-        port=8080,
+        port=port,
         title='SuperChat 监控面板', 
         reload=False, 
         favicon=''
