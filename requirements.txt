@@ -1,0 +1,5 @@
+aiohttp>=3.9.0
+aiohttp_socks>=0.8.4
+nicegui>=1.4.0
+playwright>=1.48.0
+requests>=2.32.0
