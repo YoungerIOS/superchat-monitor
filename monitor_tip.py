@@ -2337,4 +2337,10 @@ async def main():
 
 if __name__ == "__main__":
     build_ui()
-    ui.run(title='SuperChat 监控面板', reload=False, favicon='')
+    ui.run(
+        host="0.0.0.0",
+        port=8080,
+        title='SuperChat 监控面板', 
+        reload=False, 
+        favicon=''
+    )
