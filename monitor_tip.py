@@ -185,6 +185,16 @@ SELECTED_STREAMERS: set = set()
 STREAMERS_CONTAINER = None  # 用于动态更新列表
 PENDING_BROWSER_NOTIFICATIONS: list[tuple[str, str]] = []  # (title, body)
 
+# ---------- time helpers ----------
+def get_local_timezone_offset_minutes() -> int:
+    """返回当前环境的时区偏移（分钟，和 JS Date.getTimezoneOffset 一致）。"""
+    try:
+        is_dst = time.localtime().tm_isdst and time.daylight
+        offset_seconds = time.altzone if is_dst else time.timezone
+        return int(offset_seconds / 60)
+    except Exception:
+        return -480
+
 # ---------- helpers ----------
 def extract_uniq_from_html(username: str, html: str) -> str | None:
     """从主播主页 HTML 中提取 uniq"""
@@ -327,6 +337,104 @@ def fetch_page_uniq_and_cookies(username: str, headless: bool = True, nav_timeou
         err = f"ERROR in playwright fetch: {e}"
         print(err)
         return None, {}, "", err, None
+
+
+# ---------- 通过官方接口提取菜单（优先方案） ----------
+def fetch_tip_menu_via_api(username: str, nav_timeout: int = 30000) -> Dict[str, Any]:
+    result = {"menu_items": [], "detailed_items": [], "error": None, "source": "api"}
+    try:
+        state = ROOM_STATE.get(username) or {}
+        uniq = state.get("uniq")
+        cookies = state.get("cookies", {})
+        ua = state.get("ua") or "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36"
+
+        if not uniq:
+            uniq, cookies, ua, html, actual_username = fetch_page_uniq_and_cookies(username, True, nav_timeout)
+            if actual_username and actual_username != username:
+                try:
+                    if update_streamer_username(username, actual_username):
+                        username = actual_username
+                        state = ROOM_STATE.get(username) or {}
+                except Exception as rename_err:
+                    print(f"[{username}] 更新用户名失败: {rename_err}")
+            if not uniq:
+                result["error"] = "未能获取 uniq，无法调用菜单接口"
+                return result
+
+        timezone_offset = get_local_timezone_offset_minutes()
+        params = {
+            "timezoneOffset": timezone_offset,
+            "triggerRequest": "loadCam",
+            "withEnhancedMixedTags": "true",
+            "primaryTag": "girls",
+            "isRevised": "false",
+            "uniq": uniq
+        }
+
+        headers = {
+            "User-Agent": ua,
+            "Accept": "application/json, text/plain, */*",
+            "Referer": f"https://zh.superchat.live/{username}"
+        }
+        if cookies:
+            headers["Cookie"] = "; ".join([f"{k}={v}" for k, v in cookies.items()])
+
+        base_url = f"https://zh.superchat.live/api/front/v2/models/username/{username}/cam"
+        proxies = {"http": PROXY, "https": PROXY} if PROXY else None
+
+        try:
+            resp = requests.get(base_url, headers=headers, params=params, timeout=15, proxies=proxies)
+        except requests.exceptions.InvalidSchema as proxy_err:
+            if "SOCKS" in str(proxy_err).upper():
+                resp = requests.get(base_url, headers=headers, params=params, timeout=15)
+            else:
+                result["error"] = f"接口请求失败: {proxy_err}"
+                return result
+        except Exception as req_err:
+            result["error"] = f"接口请求失败: {req_err}"
+            return result
+
+        if resp.status_code != 200:
+            result["error"] = f"接口状态码 {resp.status_code}"
+            return result
+
+        try:
+            data = resp.json()
+        except ValueError as json_err:
+            result["error"] = f"JSON解析失败: {json_err}"
+            return result
+
+        tip_menu = ((data or {}).get("cam") or {}).get("tipMenu") or {}
+        settings = tip_menu.get("settings") or []
+        if not settings:
+            result["error"] = "接口未返回 tipMenu 数据"
+            return result
+
+        detailed_items = []
+        for entry in settings:
+            activity = str(entry.get("activity") or "").strip()
+            price_val = entry.get("price")
+            if not activity or price_val in (None, ""):
+                continue
+            price_text = str(price_val)
+            detailed_items.append({
+                "activity": activity,
+                "price": price_text,
+                "text": activity,
+                "raw": entry
+            })
+
+        if not detailed_items:
+            result["error"] = "tipMenu 设置为空"
+            return result
+
+        result["menu_items"] = [item["activity"] for item in detailed_items]
+        result["detailed_items"] = detailed_items
+        print(f"[{username}] 接口 tipMenu 提取到 {len(detailed_items)} 个菜单项")
+        return result
+    except Exception as e:
+        result["error"] = f"接口提取菜单异常: {e}"
+        return result
 
 
 # ---------- 从DOM元素结构提取菜单信息（使用Playwright） ----------
@@ -1853,16 +1961,23 @@ def build_streamer_row(username: str):
                                     if checkbox.value:
                                         current_dialog_selected.add(item_key)
                                 
-                                # 在后台线程中执行extract_menu_from_dom
                                 loop = asyncio.get_event_loop()
-                                result = await loop.run_in_executor(None, extract_menu_from_dom, username, True, 30000)
+                                api_result = await loop.run_in_executor(None, fetch_tip_menu_via_api, username, 30000)
+                                menu_result = api_result or {}
+                                menu_source = 'api'
+
+                                if (not menu_result.get("detailed_items")) or menu_result.get("error"):
+                                    api_error = menu_result.get("error") if menu_result else '未知错误'
+                                    if api_error:
+                                        ui.notify(f'接口获取菜单失败，尝试旧方案: {api_error}', type='warning')
+                                    dom_result = await loop.run_in_executor(None, extract_menu_from_dom, username, True, 30000)
+                                    menu_result = dom_result or {}
+                                    menu_source = 'dom'
                                 
-                                if result.get("error"):
-                                    ui.notify(f'获取菜单失败: {result["error"]}', type='negative')
-                                elif result.get("detailed_items"):
-                                    # 更新菜单列表
-                                    menu_data = result["detailed_items"]
-                                    # 保持当前对话框中的选中状态（如果菜单项还在新菜单中）
+                                if menu_result.get("error"):
+                                    ui.notify(f'获取菜单失败: {menu_result["error"]}', type='negative')
+                                elif menu_result.get("detailed_items"):
+                                    menu_data = menu_result["detailed_items"]
                                     new_selected = set()
                                     for item in menu_data:
                                         if isinstance(item, dict):
@@ -1871,17 +1986,17 @@ def build_streamer_row(username: str):
                                             activity = str(item)
                                         if activity in current_dialog_selected:
                                             new_selected.add(activity)
-                                    
-                                    # 更新current_selected（用于后续的update_menu_list）
+
                                     current_selected.clear()
                                     current_selected.update(new_selected)
                                     update_menu_list(menu_data)
-                                    # 立即持久化最新菜单列表，防止对话框意外关闭导致数据丢失
                                     try:
                                         set_streamer_menu_items(username, menu_data)
                                     except Exception as pers_err:
                                         print(f"[{username}] 保存菜单列表失败: {pers_err}")
-                                    ui.notify(f'成功获取 {len(menu_data)} 个菜单项', type='positive')
+
+                                    source_text = '接口' if menu_source == 'api' else '备用方案'
+                                    ui.notify(f'成功通过{source_text}获取 {len(menu_data)} 个菜单项', type='positive')
                                 else:
                                     ui.notify('未获取到菜单项', type='warning')
                             except Exception as e:
