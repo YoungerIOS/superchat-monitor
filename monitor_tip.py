@@ -1589,6 +1589,11 @@ def build_streamer_row(username: str):
                 await start_monitor(username)
             else:
                 stop_monitor(username)
+                try:
+                    move_streamer_to_end(username)
+                    refresh_streamers_list()
+                except Exception:
+                    pass
 
         with ui.row().classes('justify-center').style('width:11%'):
             toggle_switch = ui.switch('', value=get_streamer_running(username), on_change=on_switch_change).classes('whitespace-nowrap')
@@ -1892,6 +1897,11 @@ def move_streamer_to_index(username: str, target_index: int):
 def move_streamer_to_top(username: str):
     """将主播移动到列表第一行"""
     move_streamer_to_index(username, 0)
+
+
+def move_streamer_to_end(username: str):
+    """将主播移动到列表最后一行"""
+    move_streamer_to_index(username, len(STREAMERS))
 
 def move_streamer_below_last_live(username: str):
     """将主播移动到当前最后一个直播中主播的下一行；如果没有直播中主播，则移动到列表开头"""
