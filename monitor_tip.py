@@ -1281,6 +1281,15 @@ UI_BINDINGS: Dict[str, Dict[str, Any]] = {}
 STREAMERS_CONTAINER = None  # 用于动态更新主播列表容器
 DELETE_MODE = False  # 删除模式标志
 SELECTED_STREAMERS = set()  # 选中的主播集合
+DELETE_ACTIONS_CONTAINER = None
+DELETE_CONFIRM_BTN = None
+DELETE_CANCEL_BTN = None
+# 删除操作浮动面板
+def set_delete_actions_visibility(visible: bool):
+    if DELETE_ACTIONS_CONTAINER is not None:
+        DELETE_ACTIONS_CONTAINER.set_visibility(visible)
+
+
 
 # 夜间模式控制
 DARK_MODE = ui.dark_mode()
@@ -2094,18 +2103,21 @@ def build_ui():
             
             ui.button('添加主播', on_click=add_streamer).classes('q-btn--no-uppercase')
             
-            def toggle_delete_mode():
+            def set_delete_mode(enabled: bool):
                 global DELETE_MODE, SELECTED_STREAMERS
-                DELETE_MODE = not DELETE_MODE
-                SELECTED_STREAMERS.clear()
-                if DELETE_MODE:
-                    delete_btn.props('color=negative')
-                    confirm_delete_btn.set_visibility(True)
-                else:
-                    delete_btn.props('color=grey-7')
-                    confirm_delete_btn.set_visibility(False)
+                DELETE_MODE = enabled
+                if not enabled:
+                    SELECTED_STREAMERS.clear()
+                delete_btn.props('color=negative' if enabled else 'color=grey-7')
+                set_delete_actions_visibility(enabled)
                 refresh_streamers_list()
-            
+
+            def toggle_delete_mode():
+                set_delete_mode(not DELETE_MODE)
+
+            def cancel_delete_mode():
+                set_delete_mode(False)
+
             async def confirm_delete():
                 global DELETE_MODE, SELECTED_STREAMERS, STREAMERS
                 if not SELECTED_STREAMERS:
@@ -2125,15 +2137,11 @@ def build_ui():
                 
                 save_streamers()
                 SELECTED_STREAMERS.clear()
-                DELETE_MODE = False
-                delete_btn.props('color=grey-7')
-                confirm_delete_btn.set_visibility(False)
+                set_delete_mode(False)
                 refresh_streamers_list()
                 ui.notify(f'已删除 {deleted_count} 个主播', type='positive')
             
             delete_btn = ui.button('', on_click=toggle_delete_mode).props('icon=delete flat color=grey-7').style('min-width:auto; width:auto; height:auto; padding:0 4px')
-            confirm_delete_btn = ui.button('确定删除', on_click=confirm_delete).classes('q-btn--negative q-btn--no-uppercase')
-            confirm_delete_btn.set_visibility(False)
         
         # 中间：标题（居中）
         ui.label('SuperChat 多房间监控').classes('text-h5 absolute left-1/2 transform -translate-x-1/2')
@@ -2155,6 +2163,14 @@ def build_ui():
             global NIGHT_MODE_BUTTON
             NIGHT_MODE_BUTTON = ui.button('', on_click=on_dark_mode_click).props('flat round dense icon=light_mode text-color=white')
             update_dark_mode_button()
+
+    # 删除操作浮动面板（左下角固定）
+    global DELETE_ACTIONS_CONTAINER, DELETE_CONFIRM_BTN, DELETE_CANCEL_BTN
+    with ui.column().classes('gap-3').style('position: fixed; left: 16px; bottom: 16px; z-index: 2000; background-color: transparent; padding: 12px; border-radius: 8px; display: flex; flex-direction: column; gap: 12px;') as delete_actions_container:
+        DELETE_CONFIRM_BTN = ui.button('确定删除', on_click=confirm_delete).classes('q-btn--no-uppercase w-full').style('color: #ef4444; font-weight: 600;')
+        DELETE_CANCEL_BTN = ui.button('取消', on_click=lambda: cancel_delete_mode()).classes('q-btn--no-uppercase w-full')
+    DELETE_ACTIONS_CONTAINER = delete_actions_container
+    set_delete_actions_visibility(False)
 
     # 主播列表容器
     STREAMERS_CONTAINER = ui.column().classes('w-full max-w-5xl mx-auto p-4 gap-2').style('padding-top:0px; margin-top:-50px')
