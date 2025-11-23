@@ -1282,6 +1282,48 @@ STREAMERS_CONTAINER = None  # 用于动态更新主播列表容器
 DELETE_MODE = False  # 删除模式标志
 SELECTED_STREAMERS = set()  # 选中的主播集合
 
+# 夜间模式控制
+DARK_MODE = ui.dark_mode()
+DARK_MODE_AUTO = True
+NIGHT_MODE_BUTTON = None
+
+
+def update_dark_mode_button():
+    global NIGHT_MODE_BUTTON
+    if NIGHT_MODE_BUTTON is None:
+        return
+    if DARK_MODE_AUTO:
+        NIGHT_MODE_BUTTON.props('flat round dense icon=brightness_auto text-color=white')
+        NIGHT_MODE_BUTTON.tooltip('夜间模式：跟随系统')
+    else:
+        if DARK_MODE.value:
+            NIGHT_MODE_BUTTON.props('flat round dense icon=dark_mode text-color=white')
+            NIGHT_MODE_BUTTON.tooltip('夜间模式：深色（手动）')
+        else:
+            NIGHT_MODE_BUTTON.props('flat round dense icon=light_mode text-color=white')
+            NIGHT_MODE_BUTTON.tooltip('夜间模式：浅色（手动）')
+
+
+def apply_system_dark_mode():
+    global DARK_MODE_AUTO
+    DARK_MODE_AUTO = True
+    DARK_MODE.auto()
+    update_dark_mode_button()
+
+
+def toggle_dark_mode_manual():
+    global DARK_MODE_AUTO
+    if DARK_MODE_AUTO:
+        DARK_MODE_AUTO = False
+    if DARK_MODE.value:
+        DARK_MODE.disable()
+    else:
+        DARK_MODE.enable()
+    update_dark_mode_button()
+
+
+DARK_MODE.on_value_change(lambda _: update_dark_mode_button())
+
 
 def human_status(username: str) -> str:
     state = ROOM_STATE.get(username) or {}
@@ -1963,9 +2005,10 @@ def refresh_streamers_list():
 
 
 def build_ui():
-    global DELETE_MODE, SELECTED_STREAMERS, STREAMERS_CONTAINER
+    global DELETE_MODE, SELECTED_STREAMERS, STREAMERS_CONTAINER, NIGHT_MODE_BUTTON
     
     ui.colors(primary='#4f46e5', secondary='#64748b')
+    apply_system_dark_mode()
     
     # 启动时初始化会话并根据 running 状态自动启动监控
     async def init_and_start():
@@ -2106,6 +2149,12 @@ def build_ui():
                 await stop_all_monitors()
             ui.button('全部开启', on_click=start_all).classes('q-btn--no-uppercase')
             ui.button('全部关闭', on_click=stop_all).classes('q-btn--no-uppercase')
+
+            def on_dark_mode_click():
+                toggle_dark_mode_manual()
+            global NIGHT_MODE_BUTTON
+            NIGHT_MODE_BUTTON = ui.button('', on_click=on_dark_mode_click).props('flat round dense icon=light_mode text-color=white')
+            update_dark_mode_button()
 
     # 主播列表容器
     STREAMERS_CONTAINER = ui.column().classes('w-full max-w-5xl mx-auto p-4 gap-2').style('padding-top:0px; margin-top:-50px')
