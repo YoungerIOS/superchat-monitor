@@ -2224,7 +2224,7 @@ if __name__ == "__main__":
     build_ui()
     ui.run(
         host="0.0.0.0",
-        port=8080,
+        port=17865,
         title='SuperChat 监控面板', 
         reload=False, 
         favicon=''
