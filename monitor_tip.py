@@ -1291,47 +1291,33 @@ def set_delete_actions_visibility(visible: bool):
 
 
 
-# 夜间模式控制
+# 夜间模式控制（纯手动）
 DARK_MODE = ui.dark_mode()
-DARK_MODE_AUTO = True
+IS_DARK_MODE = False
 NIGHT_MODE_BUTTON = None
 
 
-def update_dark_mode_button():
-    global NIGHT_MODE_BUTTON
+def update_dark_mode_button() -> None:
     if NIGHT_MODE_BUTTON is None:
         return
-    if DARK_MODE_AUTO:
-        NIGHT_MODE_BUTTON.props('flat round dense icon=brightness_auto text-color=white')
-        NIGHT_MODE_BUTTON.tooltip('夜间模式：跟随系统')
-    else:
-        if DARK_MODE.value:
-            NIGHT_MODE_BUTTON.props('flat round dense icon=dark_mode text-color=white')
-            NIGHT_MODE_BUTTON.tooltip('夜间模式：深色（手动）')
-        else:
-            NIGHT_MODE_BUTTON.props('flat round dense icon=light_mode text-color=white')
-            NIGHT_MODE_BUTTON.tooltip('夜间模式：浅色（手动）')
+    icon = 'dark_mode' if IS_DARK_MODE else 'light_mode'
+    tooltip = '夜间模式：深色（点击切换为浅色）' if IS_DARK_MODE else '夜间模式：浅色（点击切换为深色）'
+    NIGHT_MODE_BUTTON.props(f'flat round dense icon={icon} text-color=white')
+    NIGHT_MODE_BUTTON.tooltip(tooltip)
 
 
-def apply_system_dark_mode():
-    global DARK_MODE_AUTO
-    DARK_MODE_AUTO = True
-    DARK_MODE.auto()
-    update_dark_mode_button()
-
-
-def toggle_dark_mode_manual():
-    global DARK_MODE_AUTO
-    if DARK_MODE_AUTO:
-        DARK_MODE_AUTO = False
-    if DARK_MODE.value:
-        DARK_MODE.disable()
-    else:
+def set_dark_mode(dark: bool) -> None:
+    global IS_DARK_MODE
+    IS_DARK_MODE = bool(dark)
+    if IS_DARK_MODE:
         DARK_MODE.enable()
+    else:
+        DARK_MODE.disable()
     update_dark_mode_button()
 
 
-DARK_MODE.on_value_change(lambda _: update_dark_mode_button())
+def toggle_dark_mode_manual() -> None:
+    set_dark_mode(not IS_DARK_MODE)
 
 
 def human_status(username: str) -> str:
@@ -2017,7 +2003,7 @@ def build_ui():
     global DELETE_MODE, SELECTED_STREAMERS, STREAMERS_CONTAINER, NIGHT_MODE_BUTTON
     
     ui.colors(primary='#4f46e5', secondary='#64748b')
-    apply_system_dark_mode()
+    set_dark_mode(False)
     
     # 启动时初始化会话并根据 running 状态自动启动监控
     async def init_and_start():
@@ -2161,7 +2147,7 @@ def build_ui():
             def on_dark_mode_click():
                 toggle_dark_mode_manual()
             global NIGHT_MODE_BUTTON
-            NIGHT_MODE_BUTTON = ui.button('', on_click=on_dark_mode_click).props('flat round dense icon=light_mode text-color=white')
+            NIGHT_MODE_BUTTON = ui.button('', on_click=on_dark_mode_click).props('flat round dense text-color=white')
             update_dark_mode_button()
 
     # 删除操作浮动面板（左下角固定）
