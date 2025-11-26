@@ -31,3 +31,4 @@ streamers.json
 *.tmp
 *.bak
 
+superchat-monitor.pid
