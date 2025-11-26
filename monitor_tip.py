@@ -592,6 +592,7 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
                     "status_loading": False,  # 初始化完成，清除加载状态
                     "model_id": None,  # 从消息中提取
                     "last_menu_tip": None,  # 最后匹配的菜单打赏信息
+                    "last_wheel_tip": None,  # 最后一次转轮游戏信息
                     "offline_check_count": 0,  # 连续检测到已下播的次数
                     "low_freq_mode": False  # 用户名变更不再强制进入低频模式
                 }
@@ -652,6 +653,7 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
                             "status_loading": old_state.get("status_loading", True),  # 刷新时保持加载状态
                             "model_id": old_state.get("model_id"),
                             "last_menu_tip": old_state.get("last_menu_tip"),
+                            "last_wheel_tip": old_state.get("last_wheel_tip"),
                             "offline_check_count": old_state.get("offline_check_count", 0),
                             "low_freq_mode": old_state.get("low_freq_mode", False)
                         }
@@ -706,6 +708,7 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
                                 "status_loading": old_state.get("status_loading", False),  # 强制刷新时保持原有加载状态
                                 "model_id": old_state.get("model_id"),
                                 "last_menu_tip": old_state.get("last_menu_tip"),
+                                "last_wheel_tip": old_state.get("last_wheel_tip"),
                                 "offline_check_count": old_state.get("offline_check_count", 0),
                                 "low_freq_mode": old_state.get("low_freq_mode", False)
                             }
@@ -956,6 +959,59 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
                                                 print(f"[{username}] ⚠️ 菜单打赏未匹配选中项，清除记录: {menu_body}")
                                     except Exception:
                                         pass
+                        
+                        # 转轮游戏监控：type="tip" 且 source="app_9"
+                        if mtype == "tip" and details.get("source") == "app_9" and ts:
+                            minutes_ago = get_minutes_ago(ts)
+                            if minutes_ago is None or minutes_ago <= 5:
+                                try:
+                                    tip_data = details.get("tipData") or {}
+                                    plugin_info = tip_data.get("plugins") if isinstance(tip_data, dict) else {}
+                                    if not isinstance(plugin_info, dict):
+                                        plugin_info = {}
+                                    plugin_data = plugin_info.get("pluginData") if isinstance(plugin_info.get("pluginData"), dict) else {}
+                                    rule_index = plugin_data.get("ruleIndex")
+                                    plugin_id = plugin_info.get("pluginId")
+                                    state = ROOM_STATE.get(username) or {}
+                                    existing = state.get("last_wheel_tip") or {}
+                                    should_update = False
+                                    current_ts = existing.get("timestamp")
+                                    if not existing:
+                                        should_update = True
+                                    elif current_ts and ts:
+                                        if ts > current_ts:
+                                            should_update = True
+                                    else:
+                                        should_update = True
+                                    if should_update:
+                                        wheel_payload = {
+                                            "amount": amt,
+                                            "user": user,
+                                            "timestamp": ts,
+                                            "id": mid,
+                                            "rule_index": rule_index,
+                                            "plugin_id": plugin_id,
+                                            "body": details.get("body", "")
+                                        }
+                                        state["last_wheel_tip"] = wheel_payload
+                                        ROOM_STATE[username] = state
+                                        rule_text = f"规则#{rule_index}" if rule_index is not None else ""
+                                        user_display = user or "匿名"
+                                        amt_display = int(amt) if isinstance(amt, (int, float)) else amt
+                                        msg = f"[{username}] 🎡 转轮游戏: user={user_display} amount={amt_display} {rule_text}".strip()
+                                        notify_print_and_telegram(msg)
+                                        if VERBOSE:
+                                            print(msg)
+                                        try:
+                                            body_parts = [user_display, f"{amt_display}代币"]
+                                            if rule_text:
+                                                body_parts.append(rule_text)
+                                            browser_notify(f"{username} 转轮游戏", " · ".join(body_parts))
+                                        except Exception:
+                                            pass
+                                except Exception as wheel_err:
+                                    if VERBOSE:
+                                        print(f"[{username}] ⚠️ 处理转轮游戏事件失败: {wheel_err}")
                         
                         # 高额打赏检查：只处理 type=="tip" 且 source=="interactiveToy" 或 source=="" 的打赏
                         # 排除菜单打赏（source="tipMenu"）和其他类型的打赏
@@ -1398,8 +1454,56 @@ def get_high_tip_time(username: str) -> str:
     return "—"
 
 
+def get_wheel_display(username: str) -> str:
+    """获取转轮游戏显示文本（包含金额和提示圆点）"""
+    state = ROOM_STATE.get(username) or {}
+    last_wheel = state.get("last_wheel_tip") or {}
+    if last_wheel:
+        ts_utc = last_wheel.get("timestamp", "")
+        if ts_utc:
+            minutes_ago = get_minutes_ago(ts_utc)
+            if minutes_ago is not None:
+                if minutes_ago > 5:
+                    try:
+                        state["last_wheel_tip"] = None
+                        ROOM_STATE[username] = state
+                    except Exception:
+                        pass
+                    return "转轮"
+                amount = last_wheel.get("amount")
+                if amount is not None:
+                    try:
+                        amt_int = int(float(amount))
+                        return f"{amt_int}币●"
+                    except Exception:
+                        return "转轮●"
+                return "转轮●"
+        return "转轮●"
+    return "转轮"
+
+
+def get_wheel_time(username: str) -> str:
+    """获取转轮游戏发生时间（显示为"x分钟前"）"""
+    state = ROOM_STATE.get(username) or {}
+    last_wheel = state.get("last_wheel_tip") or {}
+    if last_wheel:
+        ts_utc = last_wheel.get("timestamp", "")
+        if ts_utc:
+            minutes_ago = get_minutes_ago(ts_utc)
+            if minutes_ago is not None:
+                if minutes_ago > 5:
+                    try:
+                        state["last_wheel_tip"] = None
+                        ROOM_STATE[username] = state
+                    except Exception:
+                        pass
+                    return "—"
+                return "刚刚" if minutes_ago == 0 else f"{minutes_ago}分钟前"
+    return "—"
+
+
 def has_active_events(username: str) -> bool:
-    """检查是否有满足条件的小费、菜单或达标事件（即是否有粉色圆点）"""
+    """检查是否有满足条件的小费、菜单、达标或转轮事件（即是否有粉色圆点）"""
     state = ROOM_STATE.get(username) or {}
     
     # 检查是否有满足条件的高额打赏（5分钟内）
@@ -1424,6 +1528,15 @@ def has_active_events(username: str) -> bool:
     last_goal = state.get("last_threshold_goal")
     if last_goal:
         ts_utc = last_goal.get("timestamp", "")
+        if ts_utc:
+            minutes_ago = get_minutes_ago(ts_utc)
+            if minutes_ago is not None and minutes_ago <= 5:
+                return True
+
+    # 检查是否有转轮游戏事件（5分钟内）
+    last_wheel = state.get("last_wheel_tip")
+    if last_wheel:
+        ts_utc = last_wheel.get("timestamp", "")
         if ts_utc:
             minutes_ago = get_minutes_ago(ts_utc)
             if minutes_ago is not None and minutes_ago <= 5:
@@ -1555,8 +1668,8 @@ def is_running(username: str) -> bool:
 
 
 def build_streamer_row(username: str):
-    # 总宽度114.125%，固定百分比宽度：36.3%, 13.2%, 6.875%, 6.875%, 6.875%, 11%, 11%, 11%, 11%
-    # 3个堆叠列（金额、达标、选单）各6.875%，4个按钮列各11%
+    # 总宽度121%，固定百分比宽度：36.3%, 13.2%, 6.875%, 6.875%, 6.875%, 6.875%, 11%, 11%, 11%, 11%
+    # 4个堆叠列（金额、转轮、达标、选单）各6.875%，4个按钮列各11%
     with ui.row().classes('items-center gap-3 flex-nowrap').style('width:100%'):
         # 删除模式下的选择框（最左边）
         checkbox = None
@@ -1589,6 +1702,23 @@ def build_streamer_row(username: str):
                 # 即使没有圆点，也使用ui.html以便后续更新
                 tip_amount_label = ui.html(f'<span style="color: #6b7280;">{tip_amount_info}</span>', sanitize=False).classes('whitespace-nowrap text-sm')
             tip_time_label = ui.label(get_high_tip_time(username)).classes('text-gray-500 whitespace-nowrap text-xs')
+        
+        # 转轮/时间（上下堆叠）
+        with ui.column().classes('gap-0').style('width:6.875%'):
+            wheel_text = get_wheel_display(username)
+            if "●" in wheel_text:
+                base_text = wheel_text.replace("●", "")
+                wheel_label = ui.html(
+                    f'<span style="color: #6b7280;">{base_text}</span>'
+                    f'<span style="color: #ec4899; font-size: 1.2em; margin-left: 2px;">●</span>',
+                    sanitize=False
+                ).classes('whitespace-nowrap text-sm')
+            else:
+                wheel_label = ui.html(
+                    f'<span style="color: #6b7280;">{wheel_text}</span>',
+                    sanitize=False
+                ).classes('whitespace-nowrap text-sm')
+            wheel_time_label = ui.label(get_wheel_time(username)).classes('text-gray-500 whitespace-nowrap text-xs')
         
         # 达标/时间（上下堆叠）
         with ui.column().classes('gap-0').style('width:6.875%'):
@@ -1809,6 +1939,8 @@ def build_streamer_row(username: str):
             "status": status_label,
             "tip_amount": tip_amount_label,
             "tip_time": tip_time_label,
+            "wheel": wheel_label,
+            "wheel_time": wheel_time_label,
             "threshold": threshold_label,
             "threshold_time": threshold_time_label,
             "menu": menu_label,
@@ -1846,6 +1978,26 @@ def refresh_ui():
                 except AttributeError:
                     widgets["tip_amount"].text = tip_amount_info
             widgets["tip_time"].text = get_high_tip_time(username)
+            # 更新转轮信息
+            if "wheel" in widgets:
+                wheel_text = get_wheel_display(username)
+                if "●" in wheel_text:
+                    try:
+                        base_text = wheel_text.replace("●", "")
+                        widgets["wheel"].content = (
+                            f'<span style="color: #6b7280;">{base_text}</span>'
+                            f'<span style="color: #ec4899; font-size: 1.2em; margin-left: 2px;">●</span>'
+                        )
+                    except AttributeError:
+                        widgets["wheel"].text = wheel_text
+                else:
+                    try:
+                        widgets["wheel"].content = f'<span style="color: #6b7280;">{wheel_text}</span>'
+                    except AttributeError:
+                        widgets["wheel"].text = wheel_text
+            if "wheel_time" in widgets:
+                widgets["wheel_time"].text = get_wheel_time(username)
+
             # 更新达标信息
             if "threshold" in widgets:
                 th_info = get_threshold_info(username)
@@ -1977,14 +2129,15 @@ def refresh_streamers_list():
     # 重新渲染列表
     with STREAMERS_CONTAINER:
         # 顶部标题行
-        # 计算总宽度：36.3 + 13.2 + 6.875*3 + 11*4 = 114.125%
-        # 为了居中，使用114.125%，margin-left和margin-right各为-7.0625%
-        with ui.card().style('width:114.125%; margin-left:-7.0625%; margin-right:-7.0625%'):
+        # 计算总宽度：36.3 + 13.2 + 6.875*4 + 11*4 = 121%
+        # 为了居中，使用121%，margin-left和margin-right各为-10.5%
+        with ui.card().style('width:121%; margin-left:-10.5%; margin-right:-10.5%'):
             with ui.row().classes('items-center gap-3 flex-nowrap').style('width:100%'):
                 ui.label('主播名称').classes('text-gray-500 text-sm').style('width:35.8%')
                 # 状态标题：恢复为普通标题
                 ui.label('状态').classes('text-gray-500 text-sm').style('width:13.2%; text-align:left;')
                 ui.label('金额').classes('text-gray-500 text-sm').style('width:6.875%; text-align:left;')
+                ui.label('转轮').classes('text-gray-500 text-sm').style('width:6.875%; text-align:left;')
                 ui.label('达标').classes('text-gray-500 text-sm').style('width:6.875%; text-align:left;')
                 ui.label('选单').classes('text-gray-500 text-sm').style('width:6.875%; text-align:left;')
                 ui.label('监控').classes('text-gray-500 text-sm').style('width:11.5%; text-align:center;')
@@ -1995,7 +2148,7 @@ def refresh_streamers_list():
         for streamer in STREAMERS:
             username = get_streamer_username(streamer)
             if username:
-                with ui.card().style('width:114.125%; margin-left:-7.0625%; margin-right:-7.0625%'):
+                with ui.card().style('width:121%; margin-left:-10.5%; margin-right:-10.5%'):
                     build_streamer_row(username)
 
 
@@ -2228,4 +2381,4 @@ if __name__ == "__main__":
         title='SuperChat 监控面板', 
         reload=False, 
         favicon=''
-    )
+    )  
