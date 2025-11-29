@@ -184,6 +184,7 @@ DELETE_MODE = False
 SELECTED_STREAMERS: set = set()
 STREAMERS_CONTAINER = None  # 用于动态更新列表
 PENDING_BROWSER_NOTIFICATIONS: list[tuple[str, str]] = []  # (title, body)
+EVENT_ACTIVE_STATE: Dict[str, bool] = {}
 
 # ---------- time helpers ----------
 def get_local_timezone_offset_minutes() -> int:
@@ -777,6 +778,7 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
                                                     "id": mid
                                                 }
                                                 ROOM_STATE[username] = state
+                                                prioritize_streamer_on_event(username)
                                                 if VERBOSE:
                                                     print(f"[{username}] ✅ 达标事件: goal={goal_val}, ts={ts}")
                                                 try:
@@ -938,6 +940,7 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
                                                             "id": mid
                                                         }
                                                         ROOM_STATE[username] = state
+                                                        prioritize_streamer_on_event(username)
                                                         if VERBOSE:
                                                             print(f"[{username}] 🎯 菜单打赏: {menu_body} (用户: {user}, 金额: {amt}, 时间: {ts})")
                                                         try:
@@ -995,6 +998,7 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
                                         }
                                         state["last_wheel_tip"] = wheel_payload
                                         ROOM_STATE[username] = state
+                                        prioritize_streamer_on_event(username)
                                         rule_text = f"规则#{rule_index}" if rule_index is not None else ""
                                         user_display = user or "匿名"
                                         amt_display = int(amt) if isinstance(amt, (int, float)) else amt
@@ -1062,6 +1066,7 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
                                                 else:
                                                     should_update = True
                                             
+                                            updated_high_tip = False
                                             if should_update:
                                                 state["last_high_tip"] = {
                                                     "amount": amt,
@@ -1070,7 +1075,10 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
                                                     "id": mid,
                                                     "type": mtype
                                                 }
+                                                updated_high_tip = True
                                             ROOM_STATE[username] = state
+                                            if updated_high_tip:
+                                                prioritize_streamer_on_event(username)
                                         except Exception:
                                             pass
                                 except Exception as e:
@@ -1161,9 +1169,9 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
                             ROOM_STATE[username] = state
                             notify_print_and_telegram(f"[{username}] 直播状态: 🟢 直播中")
                             print(f"[{username}] 直播状态: 🟢 直播中")
-                            # 首次检测到直播时也立即移动到第一行
+                            # 首次检测到直播时，将其移动到触发区块之后
                             try:
-                                move_streamer_to_top(username)
+                                move_streamer_after_triggered_block(username)
                                 refresh_streamers_list()
                             except Exception:
                                 pass
@@ -1175,9 +1183,9 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
                             print(f"[{username}] 直播状态更新: {old_status} -> True (开播)")
                             if VERBOSE:
                                 print(f"[{username}] 状态从下播/未知变为直播，恢复正常轮询模式")
-                            # 自动排序：新上播移动到第一行
+                            # 自动排序：新上播移动到触发区块之后
                             try:
-                                move_streamer_to_top(username)
+                                move_streamer_after_triggered_block(username)
                                 refresh_streamers_list()
                             except Exception:
                                 pass
@@ -1952,11 +1960,16 @@ def build_streamer_row(username: str):
 
 def refresh_ui():
     stale_users = []
+    order_changed = False
     for username, widgets in list(UI_BINDINGS.items()):
         try:
+            has_events = has_active_events(username)
+            prev_state = EVENT_ACTIVE_STATE.get(username)
+            if prev_state != has_events:
+                EVENT_ACTIVE_STATE[username] = has_events
+                order_changed = True
             # 更新名字列背景色（根据是否有满足条件的事件）
             if "name" in widgets:
-                has_events = has_active_events(username)
                 name_bg_color = '#f9a8d4' if has_events else 'transparent'  # 更深的粉色背景或透明
                 widgets["name"].style(f'width:{"calc(36.3% - 30px)" if DELETE_MODE else "36.3%"}; background-color: {name_bg_color}; padding: 4px 8px; border-radius: 4px;')
             
@@ -2053,6 +2066,12 @@ def refresh_ui():
     for username in stale_users:
         UI_BINDINGS.pop(username, None)
 
+    if order_changed:
+        try:
+            reorder_streamers_by_event_state()
+        except Exception:
+            pass
+
 
 def sort_streamers_by_live_status():
     """按状态排序主播列表：直播中的排在最前面"""
@@ -2083,11 +2102,6 @@ def move_streamer_to_index(username: str, target_index: int):
         target_index = len(STREAMERS)
     STREAMERS.insert(target_index, streamer)
 
-def move_streamer_to_top(username: str):
-    """将主播移动到列表第一行"""
-    move_streamer_to_index(username, 0)
-
-
 def move_streamer_to_end(username: str):
     """将主播移动到列表最后一行"""
     move_streamer_to_index(username, len(STREAMERS))
@@ -2115,6 +2129,51 @@ def move_streamer_below_last_live(username: str):
     if insert_index > len(STREAMERS):
         insert_index = len(STREAMERS)
     STREAMERS.insert(insert_index, removed)
+
+def move_streamer_after_triggered_block(username: str):
+    """将主播移动到当前触发事件区块的下方（若无触发者则移动到列表开头）"""
+    global STREAMERS
+    idx, streamer = find_streamer_by_username(username)
+    if streamer is None:
+        return
+    removed = STREAMERS.pop(idx)
+    insert_index = 0
+    for i, s in enumerate(STREAMERS):
+        uname = get_streamer_username(s)
+        if uname and has_active_events(uname):
+            insert_index = i + 1
+    if insert_index < 0:
+        insert_index = 0
+    if insert_index > len(STREAMERS):
+        insert_index = len(STREAMERS)
+    STREAMERS.insert(insert_index, removed)
+
+def reorder_streamers_by_event_state() -> bool:
+    """确保所有处于触发状态的主播位于列表前方（保持相对顺序）"""
+    global STREAMERS
+    triggered = []
+    others = []
+    for streamer in STREAMERS:
+        username = get_streamer_username(streamer)
+        if username and has_active_events(username):
+            triggered.append(streamer)
+        else:
+            others.append(streamer)
+    new_order = triggered + others
+    if len(new_order) != len(STREAMERS):
+        return False
+    if any(a is not b for a, b in zip(new_order, STREAMERS)):
+        STREAMERS[:] = new_order
+        refresh_streamers_list()
+        return True
+    return False
+
+def prioritize_streamer_on_event(username: str):
+    """监控事件触发时将对应主播移动到事件区块末尾并刷新 UI"""
+    try:
+        reorder_streamers_by_event_state()
+    except Exception:
+        pass
 
 def refresh_streamers_list():
     """刷新主播列表显示"""
@@ -2273,6 +2332,7 @@ def build_ui():
                     idx, _ = find_streamer_by_username(username)
                     if idx is not None:
                         STREAMERS.pop(idx)
+                    EVENT_ACTIVE_STATE.pop(username, None)
                 
                 save_streamers()
                 SELECTED_STREAMERS.clear()
