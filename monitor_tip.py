@@ -64,6 +64,30 @@ def save_streamers():
     except Exception as e:
         print(f"保存主播列表失败: {e}")
 
+
+def ensure_stopped_streamers_at_end(persist: bool = False) -> bool:
+    """确保所有停止监控的主播排在列表末尾，返回是否调整了顺序"""
+    global STREAMERS
+    running_list = []
+    stopped_list = []
+    for streamer in STREAMERS:
+        running = False
+        if isinstance(streamer, dict):
+            running = bool(streamer.get("running", False))
+        if running:
+            running_list.append(streamer)
+        else:
+            stopped_list.append(streamer)
+    new_order = running_list + stopped_list
+    if len(new_order) != len(STREAMERS):
+        return False
+    if any(a is not b for a, b in zip(new_order, STREAMERS)):
+        STREAMERS[:] = new_order
+        if persist:
+            save_streamers()
+        return True
+    return False
+
 def get_streamer_username(streamer):
     """获取主播用户名"""
     if isinstance(streamer, dict):
@@ -161,6 +185,7 @@ def update_streamer_username(old_username: str, new_username: str):
 
 # 初始化加载
 load_streamers()
+ensure_stopped_streamers_at_end(persist=True)
 THRESHOLD = 30.0
 POLL_INTERVAL = 5        # 轮询间隔（直播中）
 OFFLINE_POLL_INTERVAL = 600  # 已下播后的低频轮询间隔（10分钟 = 600秒）
@@ -1322,6 +1347,7 @@ def stop_monitor(username: str):
     if username in ROOM_STATE:
         ROOM_STATE[username]["status_loading"] = False
         ROOM_STATE[username]["online_status"] = None
+    ensure_stopped_streamers_at_end(persist=True)
 
 
 async def stop_all_monitors():
@@ -1552,6 +1578,24 @@ def has_active_events(username: str) -> bool:
     
     return False
 
+ 
+def clear_streamer_events(username: str):
+    """清除主播的事件状态，避免在关闭监控后仍被视为触发中"""
+    state = ROOM_STATE.get(username)
+    if not state:
+        return
+    changed = False
+    for key in ("last_high_tip", "last_menu_tip", "last_threshold_goal", "last_wheel_tip"):
+        if state.get(key):
+            state[key] = None
+            changed = True
+    if state.get("high_tip_count"):
+        state["high_tip_count"] = 0
+        changed = True
+    if changed:
+        ROOM_STATE[username] = state
+    EVENT_ACTIVE_STATE.pop(username, None)
+
 def get_menu_info(username: str) -> str:
     """获取菜单信息（如果有匹配的菜单打赏，显示"选单●"，否则显示"选单"）"""
     state = ROOM_STATE.get(username) or {}
@@ -1764,8 +1808,10 @@ def build_streamer_row(username: str):
                 await start_monitor(username)
             else:
                 stop_monitor(username)
+                clear_streamer_events(username)
                 try:
                     move_streamer_to_end(username)
+                    save_streamers()
                     refresh_streamers_list()
                 except Exception:
                     pass
@@ -2079,13 +2125,15 @@ def sort_streamers_by_live_status():
     def get_status_sort_key(streamer):
         username = get_streamer_username(streamer)
         if not username:
-            return 1  # 无法获取用户名，排在后面
+            return (1,)
         state = ROOM_STATE.get(username) or {}
         status = state.get("online_status")
+        running = get_streamer_running(username)
+        if not running:
+            return (2,)
         if status is True:
-            return 0  # 直播中，排在最前面
-        else:
-            return 1  # 其他状态，排在后面
+            return (0,)
+        return (1,)
     STREAMERS.sort(key=get_status_sort_key)
 
 def move_streamer_to_index(username: str, target_index: int):
@@ -2149,17 +2197,21 @@ def move_streamer_after_triggered_block(username: str):
     STREAMERS.insert(insert_index, removed)
 
 def reorder_streamers_by_event_state() -> bool:
-    """确保所有处于触发状态的主播位于列表前方（保持相对顺序）"""
+    """事件触发的运行主播在前，未触发的运行主播其次，停监控的永远在末尾"""
     global STREAMERS
     triggered = []
-    others = []
+    running_idle = []
+    stopped = []
     for streamer in STREAMERS:
         username = get_streamer_username(streamer)
-        if username and has_active_events(username):
+        running = username and get_streamer_running(username)
+        if not running:
+            stopped.append(streamer)
+        elif has_active_events(username):
             triggered.append(streamer)
         else:
-            others.append(streamer)
-    new_order = triggered + others
+            running_idle.append(streamer)
+    new_order = triggered + running_idle + stopped
     if len(new_order) != len(STREAMERS):
         return False
     if any(a is not b for a, b in zip(new_order, STREAMERS)):
@@ -2180,6 +2232,7 @@ def refresh_streamers_list():
     global STREAMERS_CONTAINER, STREAMERS, UI_BINDINGS
     if STREAMERS_CONTAINER is None:
         return
+    ensure_stopped_streamers_at_end(persist=True)
     
     # 清空容器
     STREAMERS_CONTAINER.clear()
