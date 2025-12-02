@@ -1382,6 +1382,29 @@ def set_delete_actions_visibility(visible: bool):
 
 
 # 夜间模式控制（纯手动）
+LIGHT_THEME_COLORS = {
+    "primary": '#4f46e5',
+    "secondary": '#64748b',
+    "accent": '#6366f1',
+    "positive": '#22c55e',
+    "negative": '#ef4444',
+    "info": '#38bdf8',
+    "warning": '#f97316',
+}
+DARK_THEME_COLORS = {
+    "primary": '#0f172a',
+    "secondary": '#1e293b',
+    "accent": '#6366f1',
+    "positive": '#22c55e',
+    "negative": '#ef4444',
+    "info": '#38bdf8',
+    "warning": '#f97316',
+}
+
+def apply_theme_colors(dark: bool):
+    palette = DARK_THEME_COLORS if dark else LIGHT_THEME_COLORS
+    ui.colors(**palette)
+
 DARK_MODE = ui.dark_mode()
 IS_DARK_MODE = False
 NIGHT_MODE_BUTTON = None
@@ -1391,7 +1414,7 @@ def update_dark_mode_button() -> None:
     if NIGHT_MODE_BUTTON is None:
         return
     icon = 'dark_mode' if IS_DARK_MODE else 'light_mode'
-    tooltip = '夜间模式：深色（点击切换为浅色）' if IS_DARK_MODE else '夜间模式：浅色（点击切换为深色）'
+    tooltip = '深色（点击切换为浅色）' if IS_DARK_MODE else '浅色（点击切换为深色）'
     NIGHT_MODE_BUTTON.props(f'flat round dense icon={icon} text-color=white')
     NIGHT_MODE_BUTTON.tooltip(tooltip)
 
@@ -1403,6 +1426,7 @@ def set_dark_mode(dark: bool) -> None:
         DARK_MODE.enable()
     else:
         DARK_MODE.disable()
+    apply_theme_colors(IS_DARK_MODE)
     update_dark_mode_button()
 
 
@@ -1422,6 +1446,10 @@ def human_status(username: str) -> str:
         return "🟤 已下播"
     return "⚫️ 未知"
     # ⚫️ 🟤 🟠
+
+
+def get_status_text_color() -> str:
+    return '#dbeafe' if IS_DARK_MODE else '#1d4ed8'
 
 def to_beijing_time(iso_ts: str) -> str:
     """将 UTC 时间转换为北京时间"""
@@ -1740,7 +1768,7 @@ def build_streamer_row(username: str):
         has_events = has_active_events(username)
         name_bg_color = '#f9a8d4' if has_events else 'transparent'  # 更深的粉色背景或透明
         name_label = ui.label(username).classes('text-lg font-medium whitespace-nowrap').style(f'width:{name_width}; background-color: {name_bg_color}; padding: 4px 8px; border-radius: 4px;')
-        status_label = ui.label(human_status(username)).classes('text-primary whitespace-nowrap').style('width:13.2%')
+        status_label = ui.label(human_status(username)).classes('whitespace-nowrap').style(f'width:13.2%; color:{get_status_text_color()};')
         
         # 金额/时间（上下堆叠）
         with ui.column().classes('gap-0').style('width:6.875%'):
@@ -2020,6 +2048,7 @@ def refresh_ui():
                 widgets["name"].style(f'width:{"calc(36.3% - 30px)" if DELETE_MODE else "36.3%"}; background-color: {name_bg_color}; padding: 4px 8px; border-radius: 4px;')
             
             widgets["status"].text = human_status(username)
+            widgets["status"].style(f'width:13.2%; color:{get_status_text_color()};')
             # 更新金额信息
             tip_amount_info = get_high_tip_amount(username)
             if "●" in tip_amount_info:
@@ -2267,7 +2296,6 @@ def refresh_streamers_list():
 def build_ui():
     global DELETE_MODE, SELECTED_STREAMERS, STREAMERS_CONTAINER, NIGHT_MODE_BUTTON
     
-    ui.colors(primary='#4f46e5', secondary='#64748b')
     set_dark_mode(False)
     
     # 启动时初始化会话并根据 running 状态自动启动监控
