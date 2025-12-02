@@ -11,6 +11,7 @@ multi_room_monitor_playwright.py
 """
 
 import asyncio, re, os, time, json
+import urllib.parse as up
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
 from aiohttp_socks import ProxyConnector
@@ -206,7 +207,7 @@ ASYNC_SESSION: aiohttp.ClientSession | None = None
 
 # UI 状态
 DELETE_MODE = False
-SELECTED_STREAMERS: set = set()
+SELECTED_STREAMERS: set[int] = set()
 STREAMERS_CONTAINER = None  # 用于动态更新列表
 PENDING_BROWSER_NOTIFICATIONS: list[tuple[str, str]] = []  # (title, body)
 EVENT_ACTIVE_STATE: Dict[str, bool] = {}
@@ -222,18 +223,62 @@ def get_local_timezone_offset_minutes() -> int:
         return -480
 
 # ---------- helpers ----------
+UNIQ_VALUE_PATTERN = re.compile(r'[A-Za-z0-9_-]{6,64}')
+
+def _sanitize_uniq_candidate(value: Any) -> str | None:
+    """对可能包含 uniq 的字符串做清洗与验证。"""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        value = str(value)
+    candidate = value.strip().strip('"\'')
+    for _ in range(2):
+        try:
+            decoded = up.unquote(candidate)
+        except Exception:
+            decoded = candidate
+        candidate = decoded
+    match = UNIQ_VALUE_PATTERN.search(candidate)
+    if match:
+        return match.group(0)
+    return None
+
+def _dedup_preserve(seq: list[str]) -> list[str]:
+    seen = set()
+    result: list[str] = []
+    for item in seq:
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+def extract_uniq_candidates(text: str) -> list[str]:
+    if not text:
+        return []
+    patterns = [
+        r'/api/front/v\d+/models/username/[\w\-\.]+/chat\?[^"\s]*?uniq=([A-Za-z0-9_-]+)',
+        r'chat\?[^"\s]*?uniq=([A-Za-z0-9_-]+)',
+        r'"uniq"\s*:\s*"([A-Za-z0-9_-]+)"',
+        r"'uniq'\s*:\s*'([A-Za-z0-9_-]+)'",
+        r'uniq%22%3A%22([A-Za-z0-9_-]+)%22',
+        r'uniq%3D([A-Za-z0-9_-]+)',
+        r'uniq\\"\s*:\s*\\"([A-Za-z0-9_-]+)\\"'
+    ]
+    candidates: list[str] = []
+    for pattern in patterns:
+        for match in re.findall(pattern, text, flags=re.IGNORECASE):
+            candidate = _sanitize_uniq_candidate(match)
+            if candidate:
+                candidates.append(candidate)
+    return _dedup_preserve(candidates)
+
 def extract_uniq_from_html(username: str, html: str) -> str | None:
     """从主播主页 HTML 中提取 uniq"""
-    # 尝试多种可能的 pattern（大小写/下划线/短横）
-    patterns = [
-        rf'/api/front/v2/models/username/{re.escape(username)}/chat\?source=regular&uniq=([a-z0-9]+)',
-        rf'chat\?source=regular&uniq=([a-z0-9]+)'  # 更宽松的匹配
-    ]
-    for p in patterns:
-        m = re.search(p, html, re.IGNORECASE)
-        if m:
-            return m.group(1)
+    candidates = extract_uniq_candidates(html)
+    if candidates:
+        return candidates[0]
     return None
+
 
 def notify_print_and_telegram(text: str):
     print(text)
@@ -262,7 +307,6 @@ def fetch_page_uniq_and_cookies(username: str, headless: bool = True, nav_timeou
     - nav_timeout: 页面导航超时时间（毫秒）
     - watch_time: 在页面加载后继续监听网络请求的时间（毫秒）
     """
-    from playwright.sync_api import sync_playwright
     home = f"https://zh.superchat.live/{username}"
     print(f"[Playwright] 打开页面获取 uniq: {home} (nav_timeout={nav_timeout}ms, watch_time={watch_time}ms)")
     try:
@@ -272,13 +316,15 @@ def fetch_page_uniq_and_cookies(username: str, headless: bool = True, nav_timeou
             page = context.new_page()
 
             found = {"url": None}
+            captured_urls: list[str] = []
 
             # 回调：记录所有请求 URL，查找匹配的 chat 请求
             def on_request(req):
                 try:
                     url = req.url
-                    if "/api/front/v2/models/username/" in url and "chat?source=regular" in url:
-                        # 记录第一个命中的 URL
+                    if "uniq" in url.lower():
+                        captured_urls.append(url)
+                    if "/api/front/v2/models/username/" in url and "uniq" in url.lower():
                         if not found["url"]:
                             found["url"] = url
                             print(f"[Playwright] 捕获到 chat 请求 URL: {url}")
@@ -303,10 +349,10 @@ def fetch_page_uniq_and_cookies(username: str, headless: bool = True, nav_timeou
 
             # 如果在请求监听期间捕获到 URL，直接解析 uniq 和实际用户名
             uniq = None
+            uniq_source = None
             api_url = None
             actual_username = None
             if found["url"]:
-                import urllib.parse as up
                 parsed = up.urlparse(found["url"])
                 # 从 URL 路径中提取实际用户名：/api/front/v2/models/username/{actual_username}/chat
                 path_parts = parsed.path.split('/')
@@ -320,29 +366,130 @@ def fetch_page_uniq_and_cookies(username: str, headless: bool = True, nav_timeou
                 qs = up.parse_qs(parsed.query)
                 uvals = qs.get("uniq") or qs.get("uniq[]") or []
                 if uvals:
-                    uniq = uvals[0]
+                    uniq = _sanitize_uniq_candidate(uvals[0])
+                    uniq_source = "network-request"
                     api_url = found["url"]
                 else:
-                    # 如果没有 query parse 到 uniq，尝试用正则提取
-                    m = re.search(r"uniq=([a-z0-9]+)", found["url"], re.IGNORECASE)
+                    m = re.search(r"uniq=([A-Za-z0-9_-]+)", found["url"], re.IGNORECASE)
                     if m:
-                        uniq = m.group(1)
+                        uniq = _sanitize_uniq_candidate(m.group(1))
+                        uniq_source = "network-request-regex"
                         api_url = found["url"]
+
+            if not uniq and captured_urls:
+                for entry in captured_urls:
+                    m = re.search(r"uniq=([A-Za-z0-9_-]+)", entry, re.IGNORECASE)
+                    if not m:
+                        continue
+                    candidate = _sanitize_uniq_candidate(m.group(1))
+                    if candidate:
+                        uniq = candidate
+                        uniq_source = "captured-request"
+                        break
 
             # 如果没在请求中找到，再回退到页面 HTML 中查找
             html = page.content()
             if not uniq:
-                m2 = re.search(
-                    rf'/api/front/v2/models/username/{re.escape(username)}/chat\?source=regular&uniq=([a-z0-9]+)',
-                    html, flags=re.IGNORECASE)
-                if m2:
-                    uniq = m2.group(1)
-                    api_url = f"https://zh.superchat.live/api/front/v2/models/username/{username}/chat?source=regular&uniq={uniq}"
+                uniq_from_html = extract_uniq_from_html(username, html)
+                if uniq_from_html:
+                    uniq = uniq_from_html
+                    uniq_source = "page-html"
                     print(f"[Playwright] 在 HTML 中提取到 uniq={uniq}")
+            # 从 Nuxt 数据、脚本等再尝试提取一次（仅用于 uniq 回退，不再依赖其中的用户名字段）
+            if not uniq:
+                try:
+                    nuxt_snapshot = page.evaluate("""() => {
+                        const root = window.__NUXT__ || null;
+                        if (!root) {
+                            return null;
+                        }
+                        try {
+                            return JSON.stringify(root);
+                        } catch (err) {
+                            return null;
+                        }
+                    }""")
+                except Exception:
+                    nuxt_snapshot = None
+                if nuxt_snapshot and not uniq:
+                    uniq_from_nuxt = extract_uniq_from_html(username, nuxt_snapshot)
+                    if uniq_from_nuxt:
+                        uniq = uniq_from_nuxt
+                        uniq_source = "nuxt-state"
+                        print(f"[Playwright] 在 __NUXT__ 数据中提取到 uniq={uniq}")
+
+            if not uniq:
+                try:
+                    nuxt_data_script = page.evaluate("""() => {
+                        const el = document.querySelector('script[id="__NUXT_DATA__"]');
+                        return el ? el.textContent : null;
+                    }""")
+                except Exception:
+                    nuxt_data_script = None
+                if nuxt_data_script:
+                    uniq_from_script = extract_uniq_from_html(username, nuxt_data_script)
+                    if uniq_from_script:
+                        uniq = uniq_from_script
+                        uniq_source = "nuxt-data-script"
+                        print(f"[Playwright] 在 __NUXT_DATA__ 中提取到 uniq={uniq}")
+
+            storage_snapshots: list[dict[str, str]] = []
+            if not uniq:
+                try:
+                    local_storage = page.evaluate("""() => {
+                        if (!window.localStorage) { return null; }
+                        const data = {};
+                        for (let i = 0; i < localStorage.length; i++) {
+                            const key = localStorage.key(i);
+                            data[key] = localStorage.getItem(key);
+                        }
+                        return data;
+                    }""")
+                    if isinstance(local_storage, dict):
+                        storage_snapshots.append(local_storage)
+                except Exception:
+                    pass
+                try:
+                    session_storage = page.evaluate("""() => {
+                        if (!window.sessionStorage) { return null; }
+                        const data = {};
+                        for (let i = 0; i < sessionStorage.length; i++) {
+                            const key = sessionStorage.key(i);
+                            data[key] = sessionStorage.getItem(key);
+                        }
+                        return data;
+                    }""")
+                    if isinstance(session_storage, dict):
+                        storage_snapshots.append(session_storage)
+                except Exception:
+                    pass
+                for snapshot in storage_snapshots:
+                    if not snapshot:
+                        continue
+                    for key, value in snapshot.items():
+                        if key and "uniq" in key.lower():
+                            candidate = _sanitize_uniq_candidate(value)
+                            if candidate:
+                                uniq = candidate
+                                uniq_source = f"storage:{key}"
+                                print(f"[Playwright] 在 storage {key} 中提取到 uniq={uniq}")
+                                break
+                    if uniq:
+                        break
 
             # 导出 cookie 与 UA
             cookies = context.cookies()
             cookie_dict = {c['name']: c['value'] for c in cookies}
+            if not uniq:
+                for c in cookies:
+                    name = c.get('name', '')
+                    if name and 'uniq' in name.lower():
+                        candidate = _sanitize_uniq_candidate(c.get('value'))
+                        if candidate:
+                            uniq = candidate
+                            uniq_source = f"cookie:{name}"
+                            print(f"[Playwright] 在 Cookie {name} 中提取到 uniq={uniq}")
+                            break
             try:
                 ua = page.evaluate("() => navigator.userAgent")
             except Exception:
@@ -350,8 +497,12 @@ def fetch_page_uniq_and_cookies(username: str, headless: bool = True, nav_timeou
             
             browser.close()
 
+            final_username = actual_username or username
+            if uniq and not api_url:
+                api_url = f"https://zh.superchat.live/api/front/v2/models/username/{final_username}/chat?source=regular&uniq={uniq}"
+
             if uniq:
-                print(f"[Playwright] 成功获取 uniq={uniq}，cookies_keys={list(cookie_dict.keys())}")
+                print(f"[Playwright] 成功获取 uniq={uniq}，cookies_keys={list(cookie_dict.keys())}，来源={uniq_source or 'unknown'}")
                 if actual_username and actual_username != username:
                     print(f"[Playwright] ⚠️ 检测到用户名变更: {username} -> {actual_username}")
             else:
@@ -1747,20 +1898,24 @@ def is_running(username: str) -> bool:
     return bool(t and not t.done())
 
 
-def build_streamer_row(username: str):
+def build_streamer_row(streamer: dict):
+    username = get_streamer_username(streamer)
     # 总宽度121%，固定百分比宽度：36.3%, 13.2%, 6.875%, 6.875%, 6.875%, 6.875%, 11%, 11%, 11%, 11%
     # 4个堆叠列（金额、转轮、达标、选单）各6.875%，4个按钮列各11%
     with ui.row().classes('items-center gap-3 flex-nowrap').style('width:100%'):
         # 删除模式下的选择框（最左边）
         checkbox = None
         if DELETE_MODE:
-            def on_checkbox_change(e):
+            streamer_key = id(streamer)
+
+            def on_checkbox_change(e, key=streamer_key):
                 global SELECTED_STREAMERS
                 if e.value:
-                    SELECTED_STREAMERS.add(username)
+                    SELECTED_STREAMERS.add(key)
                 else:
-                    SELECTED_STREAMERS.discard(username)
-            checkbox = ui.checkbox('', value=username in SELECTED_STREAMERS, on_change=on_checkbox_change).style('width:30px; flex-shrink:0')
+                    SELECTED_STREAMERS.discard(key)
+
+            checkbox = ui.checkbox('', value=(streamer_key in SELECTED_STREAMERS), on_change=on_checkbox_change).style('width:30px; flex-shrink:0')
         
         # 名称列宽度：如果有选择框则减少，否则保持36.3%
         name_width = 'calc(36.3% - 30px)' if DELETE_MODE else '36.3%'
@@ -2290,7 +2445,7 @@ def refresh_streamers_list():
             username = get_streamer_username(streamer)
             if username:
                 with ui.card().style('width:121%; margin-left:-10.5%; margin-right:-10.5%'):
-                    build_streamer_row(username)
+                    build_streamer_row(streamer)
 
 
 def build_ui():
@@ -2402,19 +2557,25 @@ def build_ui():
                 if not SELECTED_STREAMERS:
                     ui.notify('请选择要删除的主播', type='warning')
                     return
-                
-                # 保存要删除的数量
-                deleted_count = len(SELECTED_STREAMERS)
-                selected_list = list(SELECTED_STREAMERS)
-                
-                # 停止选中主播的监控并删除
-                for username in selected_list:
+
+                selected_keys = set(SELECTED_STREAMERS)
+                to_delete = [streamer for streamer in list(STREAMERS) if id(streamer) in selected_keys]
+                if not to_delete:
+                    ui.notify('未找到选中的主播，请重试', type='warning')
+                    return
+
+                for streamer in to_delete:
+                    username = get_streamer_username(streamer)
+                    if not username:
+                        continue
                     stop_monitor(username)
-                    idx, _ = find_streamer_by_username(username)
-                    if idx is not None:
-                        STREAMERS.pop(idx)
+                    try:
+                        STREAMERS.remove(streamer)
+                    except ValueError:
+                        pass
                     EVENT_ACTIVE_STATE.pop(username, None)
-                
+
+                deleted_count = len(to_delete)
                 save_streamers()
                 SELECTED_STREAMERS.clear()
                 set_delete_mode(False)
