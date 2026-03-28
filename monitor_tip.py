@@ -20,7 +20,7 @@ import requests
 from playwright.sync_api import sync_playwright
 from nicegui import ui, app
 
-PROXY = "socks5://127.0.0.1:10808"  # v2rayN 的本地 SOCKS5 代理端口
+PROXY = ""  # v2rayN 的本地 SOCKS5 代理端口
 
 # ---------- 配置区 ----------
 STREAMERS_FILE = "streamers.json"
@@ -2653,7 +2653,7 @@ async def poll_superchat(username: str):
         "Cookie": cookie_header,
     }
 
-    connector = ProxyConnector.from_url(PROXY)
+    connector = ProxyConnector.from_url(PROXY) if PROXY else None
     async with aiohttp.ClientSession(connector=connector) as session:
         async with session.get(api_url, headers=headers, timeout=15) as resp:
             print(f"[{username}] 状态码:", resp.status)
