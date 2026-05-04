@@ -35,11 +35,12 @@ python -m playwright install chromium
 ## 配置和运行
 
 1. 在 `monitor_tip.py` 中配置代理PROXY（如需要）
-2. 运行程序：`python monitor_tip.py`
+2. 推荐用控制脚本启动：`./monitor_ctl.sh start --open`
+3. 或直接运行：`python monitor_tip.py`
 
 ## 使用说明
 
-1. 启动程序后，访问 `http://localhost:8080` 打开监控面板
+1. 启动程序后，访问 `http://127.0.0.1:17865`（或 `http://localhost:17865`）打开监控面板
 2. 在面板中可以：
    - 添加/删除主播
    - 查看所有主播的实时状态
@@ -52,3 +53,17 @@ python -m playwright install chromium
 - 在某些国家需要配置代理才能访问目标网站
 - 首次运行需要授权浏览器通知权限
 
+## macOS 桌面版（Tauri）
+
+已提供 macOS Tauri 桌面壳，目录：`desktop-tauri-macos/`。打包后的 DMG **自带** 监控脚本与 `requirements.txt`；用户安装后在本机完成「引导安装」即可（依赖与 venv 写入 `Application Support`），一般**无需**再克隆本仓库。每台电脑仍需已安装 **Python 3**。
+
+常用命令：
+
+```bash
+cd desktop-tauri-macos
+npm install
+npm run dev    # 开发运行
+npm run build  # 打包 .app / .dmg
+```
+
+详细说明见：`desktop-tauri-macos/README.md`。

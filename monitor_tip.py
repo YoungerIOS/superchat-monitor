@@ -10,20 +10,31 @@ multi_room_monitor_playwright.py
   python -m playwright install chromium
 """
 
-import asyncio, re, os, time, json
+import asyncio, re, os, time, json, subprocess
 import urllib.parse as up
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
 from aiohttp_socks import ProxyConnector
 import aiohttp
 import requests
+
+# Playwright Python 默认会使用其自带的 driver/node。
+# 若用户环境里设置了 PLAYWRIGHT_NODEJS_PATH，可能会强制使用系统 Node（例如 v24），
+# 进而触发 driver 通信异常（如 write EPIPE）。这里主动清理以提升稳定性。
+os.environ.pop("PLAYWRIGHT_NODEJS_PATH", None)
+
 from playwright.sync_api import sync_playwright
 from nicegui import ui, app
 
 PROXY = ""  # v2rayN 的本地 SOCKS5 代理端口
 
 # ---------- 配置区 ----------
-STREAMERS_FILE = "streamers.json"
+_SUPERCHAT_DATA = os.environ.get("SUPERCHAT_DATA_DIR", "").strip()
+STREAMERS_FILE = (
+    os.path.join(_SUPERCHAT_DATA, "streamers.json")
+    if _SUPERCHAT_DATA
+    else "streamers.json"
+)
 
 # 数据持久化函数
 def load_streamers():
@@ -197,12 +208,25 @@ VERBOSE = True
 # Telegram 推送（环境变量或直接写在这里）
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID","")
+# 手机推送（Bark / Day.app）
+# 可通过环境变量覆盖，例如:
+#   export PHONE_PUSH_BASE_URL="https://api.day.app/<你的key>"
+PHONE_PUSH_BASE_URL = os.getenv(
+    "PHONE_PUSH_BASE_URL",
+    "https://api.day.app/3oaR7upc6nHQkCPDCAuM3m",
+)
 
 # --------------------------------
 
 # 用于存放每个主播的运行时信息 (uniq, cookies)
 ROOM_STATE: Dict[str, Dict[str, Any]] = {}
 RUNNING_TASKS: Dict[str, asyncio.Task] = {}
+START_MONITOR_LOCKS: Dict[str, asyncio.Lock] = {}
+SEEN_MESSAGE_IDS: Dict[str, dict[str, float]] = {}
+SEEN_ID_LIMIT = 4000
+SEEN_ID_PRUNE = 1000
+LAST_NOTIFICATION_TS: Dict[str, float] = {}
+NOTIFY_DEDUP_WINDOW_SEC = 8.0
 ASYNC_SESSION: aiohttp.ClientSession | None = None
 
 # UI 状态
@@ -291,12 +315,64 @@ def notify_print_and_telegram(text: str):
         except Exception as e:
             print("Telegram 发送失败:", e)
 
+def push_phone_notification(title: str, body: str):
+    """通过 Bark/Day.app 推送到手机，title/body 与浏览器通知保持一致。"""
+    base_url = (PHONE_PUSH_BASE_URL or "").strip().rstrip("/")
+    if not base_url:
+        return
+    try:
+        title_enc = up.quote(str(title or "通知"), safe="")
+        body_enc = up.quote(str(body or ""), safe="")
+        push_url = f"{base_url}/{title_enc}/{body_enc}"
+        requests.get(push_url, timeout=4)
+    except Exception as e:
+        if VERBOSE:
+            print(f"[推送] 手机推送失败: {e}")
+
 def browser_notify(title: str, body: str):
-    """将通知加入队列，由前端上下文的 UI 定时器统一发送系统通知。"""
+    """发送手机推送，并将通知加入前端队列用于浏览器系统通知。"""
+    dedup_key = f"{str(title)}|{str(body)}"
+    now_ts = time.time()
+    last_ts = LAST_NOTIFICATION_TS.get(dedup_key, 0.0)
+    if now_ts - last_ts < NOTIFY_DEDUP_WINDOW_SEC:
+        if VERBOSE:
+            print(f"[通知去重] 忽略重复通知: {title} | {body}")
+        return
+    LAST_NOTIFICATION_TS[dedup_key] = now_ts
+    if len(LAST_NOTIFICATION_TS) > 5000:
+        # 控制字典大小，清理较早的一批
+        for k in list(LAST_NOTIFICATION_TS.keys())[:1000]:
+            LAST_NOTIFICATION_TS.pop(k, None)
+    # 手机推送走后台线程，避免阻塞事件循环导致前端“后台断连”
+    try:
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, push_phone_notification, title, body)
+    except Exception:
+        # 若当前不在事件循环（极少数场景），退化为同步调用
+        try:
+            push_phone_notification(title, body)
+        except Exception:
+            pass
     try:
         PENDING_BROWSER_NOTIFICATIONS.append((str(title), str(body)))
     except Exception:
         pass
+
+def is_duplicate_message(username: str, message_id: str) -> bool:
+    """全局去重消息 ID，防止并发轮询导致同一事件被重复通知。"""
+    key = str(message_id or "")
+    if not key:
+        return False
+    seen_map = SEEN_MESSAGE_IDS.setdefault(username, {})
+    if key in seen_map:
+        return True
+    seen_map[key] = time.time()
+    # 控制内存：超限后按插入顺序清理最早的一批
+    if len(seen_map) > SEEN_ID_LIMIT:
+        old_keys = list(seen_map.keys())[:SEEN_ID_PRUNE]
+        for old_key in old_keys:
+            seen_map.pop(old_key, None)
+    return False
 
 # ---------- Playwright helpers (同步 API used in dedicated thread) ----------
 # 替换用的 fetch_page_uniq_and_cookies（同步，供 run_in_executor 使用）
@@ -334,7 +410,9 @@ def fetch_page_uniq_and_cookies(username: str, headless: bool = True, nav_timeou
             page.on("request", on_request)
 
             # 导航并等待基本加载
-            page.goto(home, timeout=nav_timeout)
+            # 该站点常见情况是页面资源/长连接导致 "load" 久等不返回，
+            # 用 domcontentloaded 能显著降低超时概率，同时不影响我们监听 XHR 来抓 uniq。
+            page.goto(home, timeout=nav_timeout, wait_until="domcontentloaded")
             # 等待 networkidle，之后再继续监听一段时间（以便捕获动态 XHR）
             try:
                 page.wait_for_load_state("networkidle", timeout=8000)
@@ -723,17 +801,34 @@ async def check_online_status_via_search(session: aiohttp.ClientSession, usernam
 # ---------- Async polling worker ----------
 async def poll_room(session: aiohttp.ClientSession, username: str):
     """异步轮询某房间的 /chat 接口，依赖 ROOM_STATE[username]['api_url'] & cookies"""
-    seen = set()
+    task_self = asyncio.current_task()
     last_uniq_refresh = 0
     while True:
         try:
+            # 只允许当前登记任务继续运行，避免并发重复轮询造成重复通知
+            current = RUNNING_TASKS.get(username)
+            if current is None:
+                return
+            if current is not task_self:
+                return
+
             state = ROOM_STATE.get(username)
             if not state or not state.get("api_url"):
                 # 先用 Playwright 获取一次 uniq + cookies（在 executor 中运行）
                 loop = asyncio.get_event_loop()
-                uniq, cookies, ua, html, actual_username = await loop.run_in_executor(None, fetch_page_uniq_and_cookies, username, True, 20000)
+                uniq, cookies, ua, html, actual_username = await loop.run_in_executor(None, fetch_page_uniq_and_cookies, username, True, 10000)
                 if not uniq:
                     print(f"[{username}] Playwright 未提取到 uniq，稍候重试")
+                    # 重要：不要让 UI 永远停在“加载中”
+                    # 后台仍会重试，但前端应降级为“未知”，并可显示最近一次错误原因。
+                    try:
+                        cur = ROOM_STATE.get(username) or {}
+                        cur["status_loading"] = False
+                        cur["online_status"] = None
+                        cur["last_error"] = "未能获取 uniq（页面加载超时或被拦截），后台将继续重试"
+                        ROOM_STATE[username] = cur
+                    except Exception:
+                        pass
                     await asyncio.sleep(5)
                     continue
                 
@@ -797,7 +892,7 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
                     print(f"[{username}] 非 200 或返回 HTML({resp.status}), 刷新 uniq")
                     # 使用 Playwright 在后台刷新
                     loop = asyncio.get_event_loop()
-                    uniq, cookies, ua, html, actual_username = await loop.run_in_executor(None, fetch_page_uniq_and_cookies, username, True, 20000)
+                    uniq, cookies, ua, html, actual_username = await loop.run_in_executor(None, fetch_page_uniq_and_cookies, username, True, 10000)
                     if uniq:
                         # 检测用户名变更
                         username_changed = False
@@ -854,7 +949,7 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
                     if not low_freq_mode and time.time() - state.get("last_refresh",0) > REFRESH_UNIQ_INTERVAL:
                         print(f"[{username}] 强制周期刷新 uniq")
                         loop = asyncio.get_event_loop()
-                        uniq, cookies, ua, html, actual_username = await loop.run_in_executor(None, fetch_page_uniq_and_cookies, username, True, 20000)
+                        uniq, cookies, ua, html, actual_username = await loop.run_in_executor(None, fetch_page_uniq_and_cookies, username, True, 10000)
                         if uniq:
                             # 检测用户名变更
                             username_changed = False
@@ -895,9 +990,8 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
                 else:
                     for m in msgs:
                         mid = str(m.get("id") or f"{m.get('createdAt')}_{m.get('cacheId')}")
-                        if mid in seen:
+                        if is_duplicate_message(username, mid):
                             continue
-                        seen.add(mid)
                         
                         # 提取 modelId（如果还没有）
                         if not state.get("model_id") and m.get("modelId"):
@@ -1476,34 +1570,65 @@ async def ensure_session() -> aiohttp.ClientSession:
 
 
 async def start_monitor(username: str):
-    if username in RUNNING_TASKS and not RUNNING_TASKS[username].done():
+    lock = START_MONITOR_LOCKS.get(username)
+    if lock is None:
+        lock = asyncio.Lock()
+        START_MONITOR_LOCKS[username] = lock
+
+    async with lock:
+        current = RUNNING_TASKS.get(username)
+        if current and not current.done():
+            return
+        # 设置加载状态
+        if username not in ROOM_STATE:
+            ROOM_STATE[username] = {}
+        ROOM_STATE[username]["status_loading"] = True
+        session = await ensure_session()
+        task = asyncio.create_task(poll_room(session, username))
+        task.add_done_callback(lambda t, u=username: _on_monitor_task_done(u, t))
+        RUNNING_TASKS[username] = task
+        set_streamer_running(username, True)
+
+
+def _on_monitor_task_done(username: str, task: asyncio.Task):
+    """监控任务结束后的收尾，防止状态长期停留在“加载中”或“运行中”"""
+    current = RUNNING_TASKS.get(username)
+    if current is not task:
         return
-    # 设置加载状态
-    if username not in ROOM_STATE:
-        ROOM_STATE[username] = {}
-    ROOM_STATE[username]["status_loading"] = True
-    session = await ensure_session()
-    task = asyncio.create_task(poll_room(session, username))
-    RUNNING_TASKS[username] = task
-    set_streamer_running(username, True)
+    RUNNING_TASKS.pop(username, None)
+    # 任务意外结束时，确保 UI 状态回收
+    set_streamer_running(username, False)
+    state = ROOM_STATE.get(username)
+    if state is not None:
+        state["status_loading"] = False
+        if state.get("online_status") not in (True, False):
+            state["online_status"] = None
+    if not task.cancelled():
+        try:
+            exc = task.exception()
+        except Exception:
+            exc = None
+        if exc and VERBOSE:
+            print(f"[{username}] 监控任务异常退出: {exc}")
 
 
-def stop_monitor(username: str):
+def stop_monitor(username: str, persist_running: bool = True):
     task = RUNNING_TASKS.get(username)
     if task and not task.done():
         task.cancel()
     RUNNING_TASKS.pop(username, None)
-    set_streamer_running(username, False)
+    if persist_running:
+        set_streamer_running(username, False)
     # 清除加载状态并将状态置为未知
     if username in ROOM_STATE:
         ROOM_STATE[username]["status_loading"] = False
         ROOM_STATE[username]["online_status"] = None
-    ensure_stopped_streamers_at_end(persist=True)
+    ensure_stopped_streamers_at_end(persist=persist_running)
 
 
-async def stop_all_monitors():
+async def stop_all_monitors(persist_running: bool = True):
     for u in list(RUNNING_TASKS.keys()):
-        stop_monitor(u)
+        stop_monitor(u, persist_running=persist_running)
 
 
 async def close_session():
@@ -1559,6 +1684,10 @@ def apply_theme_colors(dark: bool):
 DARK_MODE = ui.dark_mode()
 IS_DARK_MODE = False
 NIGHT_MODE_BUTTON = None
+NOTIF_BUTTON = None
+NOTIF_PERMISSION = "default"   # granted / denied / default / unsupported / error
+NOTIF_ENABLED = False          # 铃铛开关状态（与浏览器权限分离）
+NOTIF_ENABLED_STORAGE_KEY = "superchat_notif_enabled"
 
 
 def update_dark_mode_button() -> None:
@@ -1566,8 +1695,36 @@ def update_dark_mode_button() -> None:
         return
     icon = 'dark_mode' if IS_DARK_MODE else 'light_mode'
     tooltip = '深色（点击切换为浅色）' if IS_DARK_MODE else '浅色（点击切换为深色）'
-    NIGHT_MODE_BUTTON.props(f'flat round dense icon={icon} text-color=white')
-    NIGHT_MODE_BUTTON.tooltip(tooltip)
+    NIGHT_MODE_BUTTON.props(
+        f'flat round dense icon={icon} text-color=white title={json.dumps(tooltip, ensure_ascii=False)}'
+    )
+
+
+def update_notif_button(permission: str, enabled: bool) -> None:
+    if NOTIF_BUTTON is None:
+        return
+    perm = str(permission or "default")
+    if perm == "granted" and enabled:
+        icon = "notifications_active"
+        tooltip = "通知: 已开启（点击关闭）"
+    elif perm == "granted" and not enabled:
+        icon = "notifications_none"
+        tooltip = "通知: 已关闭（点击开启）"
+    elif perm == "denied":
+        icon = "notifications_off"
+        tooltip = "通知权限: 已拒绝（点击后在浏览器设置中允许）"
+    elif perm == "unsupported":
+        icon = "speaker_notes_off"
+        tooltip = "通知权限: 浏览器不支持"
+    elif perm == "error":
+        icon = "notification_important"
+        tooltip = "通知权限: 状态获取失败（点击重试）"
+    else:
+        icon = "notification_add"
+        tooltip = "通知权限: 未设置（点击请求权限）"
+    NOTIF_BUTTON.props(
+        f'flat round dense icon={icon} text-color=white title={json.dumps(tooltip, ensure_ascii=False)}'
+    )
 
 
 def set_dark_mode(dark: bool) -> None:
@@ -1900,8 +2057,8 @@ def is_running(username: str) -> bool:
 
 def build_streamer_row(streamer: dict):
     username = get_streamer_username(streamer)
-    # 总宽度121%，固定百分比宽度：36.3%, 13.2%, 6.875%, 6.875%, 6.875%, 6.875%, 11%, 11%, 11%, 11%
-    # 4个堆叠列（金额、转轮、达标、选单）各6.875%，4个按钮列各11%
+    # 总宽度121%，固定百分比宽度：24.8%, 13.2%, 6.875%*4, 11.5%, 11%, 11%, 11%, 11%
+    # 4个堆叠列（金额、转轮、达标、选单）各6.875%，5个按钮列（监控/配置/复制网址/直播间/选单详情）
     with ui.row().classes('items-center gap-3 flex-nowrap').style('width:100%'):
         # 删除模式下的选择框（最左边）
         checkbox = None
@@ -1917,8 +2074,8 @@ def build_streamer_row(streamer: dict):
 
             checkbox = ui.checkbox('', value=(streamer_key in SELECTED_STREAMERS), on_change=on_checkbox_change).style('width:30px; flex-shrink:0')
         
-        # 名称列宽度：如果有选择框则减少，否则保持36.3%
-        name_width = 'calc(36.3% - 30px)' if DELETE_MODE else '36.3%'
+        # 名称列宽度：新增“复制网址”按钮后，从名称列让出 11%
+        name_width = 'calc(24.8% - 30px)' if DELETE_MODE else '24.8%'
         # 检查是否有满足条件的事件，决定背景色
         has_events = has_active_events(username)
         name_bg_color = '#f9a8d4' if has_events else 'transparent'  # 更深的粉色背景或透明
@@ -2161,6 +2318,18 @@ def build_streamer_row(streamer: dict):
 
         cfg_btn = ui.button('配置', on_click=open_config).classes('q-btn--outline q-btn--no-uppercase whitespace-nowrap').style('width:11%')
 
+        def copy_room_url():
+            url = f"https://zh.superchat.live/{username}"
+            try:
+                # 在 macOS 上直接写入系统剪贴板，避免浏览器权限限制
+                subprocess.run(["pbcopy"], input=url, text=True, check=True)
+                ui.notify('直播间网址已复制到剪贴板', type='positive')
+            except Exception as e:
+                print(f"[{username}] 复制网址失败: {e}")
+                ui.notify('复制失败，请手动复制网址', type='warning')
+
+        copy_btn = ui.button('复制网址', on_click=copy_room_url).classes('q-btn--outline q-btn--no-uppercase whitespace-nowrap').style('width:11%')
+
         def open_room():
             url = f"https://zh.superchat.live/{username}"
             ui.run_javascript(f'window.open("{url}", "_blank")')
@@ -2200,7 +2369,7 @@ def refresh_ui():
             # 更新名字列背景色（根据是否有满足条件的事件）
             if "name" in widgets:
                 name_bg_color = '#f9a8d4' if has_events else 'transparent'  # 更深的粉色背景或透明
-                widgets["name"].style(f'width:{"calc(36.3% - 30px)" if DELETE_MODE else "36.3%"}; background-color: {name_bg_color}; padding: 4px 8px; border-radius: 4px;')
+                widgets["name"].style(f'width:{"calc(24.8% - 30px)" if DELETE_MODE else "24.8%"}; background-color: {name_bg_color}; padding: 4px 8px; border-radius: 4px;')
             
             widgets["status"].text = human_status(username)
             widgets["status"].style(f'width:13.2%; color:{get_status_text_color()};')
@@ -2425,11 +2594,11 @@ def refresh_streamers_list():
     # 重新渲染列表
     with STREAMERS_CONTAINER:
         # 顶部标题行
-        # 计算总宽度：36.3 + 13.2 + 6.875*4 + 11*4 = 121%
+        # 计算总宽度：24.8 + 13.2 + 6.875*4 + 11.5 + 11*4 = 121%
         # 为了居中，使用121%，margin-left和margin-right各为-10.5%
         with ui.card().style('width:121%; margin-left:-10.5%; margin-right:-10.5%'):
             with ui.row().classes('items-center gap-3 flex-nowrap').style('width:100%'):
-                ui.label('主播名称').classes('text-gray-500 text-sm').style('width:35.8%')
+                ui.label('主播名称').classes('text-gray-500 text-sm').style('width:24.8%')
                 # 状态标题：恢复为普通标题
                 ui.label('状态').classes('text-gray-500 text-sm').style('width:13.2%; text-align:left;')
                 ui.label('金额').classes('text-gray-500 text-sm').style('width:6.875%; text-align:left;')
@@ -2438,6 +2607,7 @@ def refresh_streamers_list():
                 ui.label('选单').classes('text-gray-500 text-sm').style('width:6.875%; text-align:left;')
                 ui.label('监控').classes('text-gray-500 text-sm').style('width:11.5%; text-align:center;')
                 ui.label('配置').classes('text-gray-500 text-sm').style('width:11%; text-align:center;')
+                ui.label('复制网址').classes('text-gray-500 text-sm').style('width:11%; text-align:center;')
                 ui.label('直播间').classes('text-gray-500 text-sm').style('width:11%; text-align:center;')
                 ui.label('选单详情').classes('text-gray-500 text-sm').style('width:11%; text-align:center;')
         
@@ -2449,7 +2619,8 @@ def refresh_streamers_list():
 
 
 def build_ui():
-    global DELETE_MODE, SELECTED_STREAMERS, STREAMERS_CONTAINER, NIGHT_MODE_BUTTON
+    global DELETE_MODE, SELECTED_STREAMERS, STREAMERS_CONTAINER, NIGHT_MODE_BUTTON, NOTIF_BUTTON, NOTIF_PERMISSION, NOTIF_ENABLED
+    page_client = ui.context.client
     
     set_dark_mode(False)
     
@@ -2470,33 +2641,86 @@ def build_ui():
         asyncio.create_task(init_and_start())
     
     ui.timer(0.1, start_init, once=True)
-    # 请求浏览器通知权限（如果还未授权）
-    def _request_notif_perm():
-        ui.run_javascript("if ('Notification' in window && Notification.permission === 'default') { Notification.requestPermission(); }")
-    ui.timer(0.5, _headless := (lambda: _request_notif_perm()), once=True)
+    # 为保证剪贴板 API 可用，强制使用 localhost 打开页面（局域网 IP 常被浏览器判定为非可信上下文）
+    def _force_localhost_for_clipboard():
+        page_client.run_javascript("""
+            (() => {
+                try {
+                    const h = window.location.hostname;
+                    const isLocalhost = (h === 'localhost');
+                    if (!isLocalhost) {
+                        const target = `http://localhost:${window.location.port}${window.location.pathname}${window.location.search}${window.location.hash}`;
+                        window.location.replace(target);
+                    }
+                } catch (e) {}
+            })();
+        """)
+    ui.timer(0.15, _force_localhost_for_clipboard, once=True)
+    async def refresh_notif_status(client=None):
+        global NOTIF_PERMISSION, NOTIF_ENABLED
+        if NOTIF_BUTTON is None:
+            return False
+        runner = (client.run_javascript if client is not None else ui.run_javascript)
+        try:
+            state = await runner(f"""
+                (() => {{
+                    if (!('Notification' in window)) {{
+                        return {{ permission: 'unsupported', enabled: false, has_setting: false }};
+                    }}
+                    const permission = Notification.permission || 'default';
+                    const enabledRaw = localStorage.getItem({json.dumps(NOTIF_ENABLED_STORAGE_KEY)});
+                    const hasSetting = enabledRaw !== null;
+                    const enabled = enabledRaw === '1' || enabledRaw === 'true';
+                    return {{ permission, enabled, has_setting: hasSetting }};
+                }})()
+            """)
+            if isinstance(state, dict):
+                NOTIF_PERMISSION = str(state.get("permission", "default"))
+                requested_enabled = bool(state.get("enabled", False))
+                has_setting = bool(state.get("has_setting", False))
+            else:
+                NOTIF_PERMISSION = str(state or "default")
+                requested_enabled = False
+                has_setting = False
+
+            if NOTIF_PERMISSION == "granted":
+                # 已授权但本地尚无开关记录时，默认开启通知
+                if has_setting:
+                    NOTIF_ENABLED = requested_enabled
+                else:
+                    NOTIF_ENABLED = True
+                    try:
+                        await runner(
+                            f"localStorage.setItem({json.dumps(NOTIF_ENABLED_STORAGE_KEY)}, '1');"
+                        )
+                    except Exception:
+                        pass
+            else:
+                NOTIF_ENABLED = False
+            update_notif_button(NOTIF_PERMISSION, NOTIF_ENABLED)
+            return True
+        except Exception:
+            # Safari 下定时轮询可能偶发拿不到前端上下文，避免把按钮反复重置到 error
+            return False
     # 从队列中发送系统通知（在客户端上下文执行）
     def _drain_notifications():
         try:
             while PENDING_BROWSER_NOTIFICATIONS:
                 title, body = PENDING_BROWSER_NOTIFICATIONS.pop(0)
+                if not NOTIF_ENABLED:
+                    continue
                 js = f"""
                 (function() {{
                   try {{
                     if ('Notification' in window) {{
                       if (Notification.permission === 'granted') {{
                         new Notification({json.dumps(''+title)}, {{ body: {json.dumps(''+body)} }});
-                      }} else if (Notification.permission === 'default') {{
-                        Notification.requestPermission().then(function (perm) {{
-                          if (perm === 'granted') {{
-                            new Notification({json.dumps(''+title)}, {{ body: {json.dumps(''+body)} }});
-                          }}
-                        }});
                       }}
                     }}
                   }} catch (e) {{}}
                 }})();
                 """
-                ui.run_javascript(js)
+                page_client.run_javascript(js)
         except Exception:
             pass
     ui.timer(1.0, _drain_notifications)
@@ -2589,6 +2813,23 @@ def build_ui():
         
         # 右侧：全部开启/关闭按钮
         with ui.row().classes('items-center gap-2'):
+            async def request_program_exit():
+                with ui.dialog() as exit_dialog, ui.card().style('width: 460px; padding: 20px;'):
+                    ui.label('退出程序').classes('text-h6')
+                    ui.label('将停止全部监控并退出后台程序，是否继续？').classes('text-body2').style('margin-top: 8px;')
+
+                    with ui.row().classes('w-full justify-end gap-2').style('margin-top: 14px;'):
+                        async def confirm_exit():
+                            exit_dialog.close()
+                            ui.notify('正在退出程序...', type='warning')
+                            await stop_all_monitors(persist_running=False)
+                            await close_session()
+                            app.shutdown()
+
+                        ui.button('取消', on_click=exit_dialog.close).classes('q-btn--no-uppercase')
+                        ui.button('确定退出', on_click=confirm_exit).props('color=negative').classes('q-btn--no-uppercase')
+                exit_dialog.open()
+
             async def start_all():
                 for streamer in STREAMERS:
                     username = get_streamer_username(streamer)
@@ -2596,14 +2837,86 @@ def build_ui():
                         await start_monitor(username)
             async def stop_all():
                 await stop_all_monitors()
+            ui.button('退出程序', on_click=request_program_exit).props('text-color=negative').classes('q-btn--no-uppercase')
             ui.button('全部开启', on_click=start_all).classes('q-btn--no-uppercase')
             ui.button('全部关闭', on_click=stop_all).classes('q-btn--no-uppercase')
 
+            async def toggle_notifications():
+                global NOTIF_PERMISSION, NOTIF_ENABLED
+                prev_permission = NOTIF_PERMISSION
+                await refresh_notif_status(page_client)
+
+                # 如果按钮显示的是旧状态（例如仍显示“未授权”），首次点击只做同步，不立刻反向切换
+                if prev_permission != "granted" and NOTIF_PERMISSION == "granted":
+                    if NOTIF_ENABLED:
+                        ui.notify('浏览器通知已开启', type='positive')
+                    else:
+                        ui.notify('浏览器通知当前为关闭，点击可开启', type='warning')
+                    return
+                # 有权限：切换开关
+                if NOTIF_PERMISSION == "granted":
+                    NOTIF_ENABLED = not NOTIF_ENABLED
+                    await page_client.run_javascript(
+                        f"localStorage.setItem({json.dumps(NOTIF_ENABLED_STORAGE_KEY)}, {json.dumps('1')});"
+                        if NOTIF_ENABLED
+                        else f"localStorage.setItem({json.dumps(NOTIF_ENABLED_STORAGE_KEY)}, {json.dumps('0')});"
+                    )
+                    update_notif_button(NOTIF_PERMISSION, NOTIF_ENABLED)
+                    ui.notify('浏览器通知已开启' if NOTIF_ENABLED else '浏览器通知已关闭',
+                              type='positive' if NOTIF_ENABLED else 'warning')
+                    return
+
+                # 未设置：请求权限，若同意则自动开启
+                if NOTIF_PERMISSION in ("default", "", None):
+                    ui.notify('正在请求通知权限...', type='info')
+                    try:
+                        perm = await page_client.run_javascript("""
+                            (async () => {
+                                if (!('Notification' in window)) return 'unsupported';
+                                return await Notification.requestPermission();
+                            })()
+                        """, timeout=120.0)
+                    except Exception:
+                        perm = None
+                    if perm is not None:
+                        NOTIF_PERMISSION = str(perm or "default")
+
+                    # 统一以浏览器实时状态为准，避免按钮状态和实际授权结果不同步
+                    await refresh_notif_status(page_client)
+                    if NOTIF_ENABLED:
+                        ui.notify('浏览器通知已开启', type='positive')
+                    elif NOTIF_PERMISSION == 'denied':
+                        ui.notify('通知权限被拒绝，请在浏览器的网站设置中允许通知', type='warning')
+                    elif NOTIF_PERMISSION == 'unsupported':
+                        ui.notify('当前浏览器不支持通知权限', type='warning')
+                    else:
+                        ui.notify('通知权限未授予，可点击铃铛再次请求', type='warning')
+                    return
+
+                # denied / unsupported / error: 给出明确指引，不再按点击次数决定行为
+                if NOTIF_PERMISSION == 'denied':
+                    ui.notify('通知权限被拒绝，请在浏览器的网站设置中允许通知', type='warning')
+                elif NOTIF_PERMISSION == 'unsupported':
+                    ui.notify('当前浏览器不支持通知权限', type='warning')
+                else:
+                    ui.notify('通知状态读取失败，请刷新页面后重试', type='warning')
+
             def on_dark_mode_click():
                 toggle_dark_mode_manual()
+            global NOTIF_BUTTON
+            NOTIF_BUTTON = ui.button('', on_click=toggle_notifications).props('flat round dense')
+            update_notif_button(NOTIF_PERMISSION, NOTIF_ENABLED)
             global NIGHT_MODE_BUTTON
             NIGHT_MODE_BUTTON = ui.button('', on_click=on_dark_mode_click).props('flat round dense text-color=white')
             update_dark_mode_button()
+
+    # 启动后做多次短间隔同步，避免 Safari 偶发拿不到前端上下文导致状态一直停在默认值
+    def _schedule_notif_refresh():
+        asyncio.create_task(refresh_notif_status(page_client))
+    page_client.on_connect(lambda _=None: asyncio.create_task(refresh_notif_status(page_client)))
+    ui.timer(0.8, _schedule_notif_refresh, once=True)
+    ui.timer(1.8, _schedule_notif_refresh, once=True)
+    ui.timer(3.0, _schedule_notif_refresh, once=True)
 
     # 删除操作浮动面板（左下角固定）
     global DELETE_ACTIONS_CONTAINER, DELETE_CONFIRM_BTN, DELETE_CANCEL_BTN
@@ -2631,7 +2944,7 @@ async def _on_startup():
 
 
 async def _on_shutdown():
-    await stop_all_monitors()
+    await stop_all_monitors(persist_running=False)
     await close_session()
 
 async def poll_superchat(username: str):
@@ -2681,6 +2994,7 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=17865,
         title='SuperChat 监控面板', 
+        show=False,
         reload=False, 
         favicon=''
     )  

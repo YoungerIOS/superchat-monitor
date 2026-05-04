@@ -5,7 +5,7 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CTL="$DIR/monitor_ctl.sh"
-URL="http://127.0.0.1:17865"
+URL="http://localhost:17865"
 
 chmod +x "$CTL" 2>/dev/null || true
 
