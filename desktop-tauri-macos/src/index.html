@@ -14,10 +14,6 @@
 
       <section class="panel">
         <div class="row controls">
-          <button id="btn-setup" class="accent">安装依赖</button>
-          <button id="btn-python-dl" type="button" class="primary" hidden>
-            打开 Python 官网
-          </button>
           <button id="btn-start" class="success">启动服务</button>
           <button id="btn-open" class="primary">打开面板</button>
           <button id="btn-stop">停止服务</button>
@@ -36,9 +32,9 @@
       <section class="tips">
         <h2>说明</h2>
         <ul>
-          <li>若软件提示未检测到 Python，请到 <a href="https://www.python.org/downloads/" target="_blank" rel="noopener noreferrer">Python 官网</a> 下载安装后，重启应用再点「安装依赖」。</li>
-          <li>首次使用操作顺序：先点「安装依赖」，安装可能耗时较长；完成后再点「启动服务」- 「打开面板」。</li>
-          <li>日常使用如果启动失败，先点「刷新状态」查看提示；需要排查细节时点「查看日志」。</li>
+          <li>应用会自动检测内置 Python、虚拟环境、依赖与 Chromium 的可用性，并显示在状态区。</li>
+          <li>点击「启动服务」时若环境未就绪，会自动进入依赖和 Chromium 的下载安装流程。</li>
+          <li>首次安装通常较慢；可先观察状态区进度与提示，必要时点击「查看日志」排查细节。</li>
         </ul>
       </section>
     </main>

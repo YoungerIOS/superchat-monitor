@@ -8,8 +8,7 @@ use tauri::Manager;
 const PROJECT_DIR_CACHE_FILE: &str = "project_dir.txt";
 const MANAGED_VENV_DIR: &str = ".venv-desktop";
 const DATA_SUBDIR: &str = "superchat-monitor";
-/// 最简安装方式：官方安装包（macOS pkg），安装时勾选将 Python 加入 PATH
-const PYTHON_DOWNLOAD_URL: &str = "https://www.python.org/downloads/";
+const EMBEDDED_PYTHON_RELATIVE: &str = "bundled-python/bin/python3";
 
 fn is_valid_runtime_dir(path: &Path) -> bool {
     path.join("monitor_ctl.sh").is_file() && path.join("monitor_tip.py").is_file()
@@ -19,44 +18,50 @@ fn managed_python_path(data_dir: &Path) -> PathBuf {
     data_dir.join(MANAGED_VENV_DIR).join("bin").join("python3")
 }
 
-/// 用于 `python3 -m venv`：依次尝试 python3.12 / 3.11 / 3.10 / python3，排除无 venv 或版本低于 3.9 的解释器。
-fn find_usable_bootstrap_python() -> Option<PathBuf> {
-    let script = r#"
-set -e
-for c in python3.12 python3.11 python3.10 python3; do
-  p=$(command -v "$c" 2>/dev/null) || continue
-  if "$p" -c 'import venv, sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
-    printf '%s\n' "$p"
-    exit 0
-  fi
-done
-exit 1
+fn embedded_python_missing_message() -> String {
+    "未检测到应用内置 Python 运行时（bundled-python）。请重新安装应用或联系开发者。".to_string()
+}
+
+fn resolve_embedded_python(app: &tauri::AppHandle, runtime_dir: &Path) -> Option<PathBuf> {
+    if let Ok(custom) = env::var("SUPERCHAT_EMBEDDED_PYTHON") {
+        let path = PathBuf::from(custom);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let bundled = resource_dir.join(EMBEDDED_PYTHON_RELATIVE);
+        if bundled.is_file() {
+            return Some(bundled);
+        }
+    }
+
+    // 开发模式：允许从仓库内预置的 bundled-python 调试。
+    #[cfg(debug_assertions)]
+    {
+        let dev_candidate = runtime_dir
+            .join("desktop-tauri-macos")
+            .join("src-tauri")
+            .join(EMBEDDED_PYTHON_RELATIVE);
+        if dev_candidate.is_file() {
+            return Some(dev_candidate);
+        }
+    }
+
+    None
+}
+
+fn check_embedded_python_usable(python: &Path, cwd: &Path) -> Result<String, String> {
+    let py_code = r#"
+import platform, sys, venv
+ok = sys.version_info >= (3, 9)
+print(f"{sys.executable} :: Python {platform.python_version()}")
+raise SystemExit(0 if ok else 2)
 "#;
-    let output = Command::new("/bin/bash")
-        .args(["-lc", script])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(text))
-}
-
-fn python_missing_user_message() -> String {
-    format!(
-        "未检测到可用于创建虚拟环境的 Python 3（需要 3.9 及以上，且包含 venv 模块）。\n\n\
-         推荐：点击「打开 Python 官网」，下载 macOS 官方安装包并安装；安装末尾请勾选「Install or add Python to PATH」（将 Python 加入 PATH）。\n\n\
-         安装完成后请完全退出并重新打开本应用，再点击「安装依赖」。\n\n\
-         下载页：{PYTHON_DOWNLOAD_URL}"
-    )
-}
-
-fn python_bootstrap_install_error() -> String {
-    python_missing_user_message()
+    let mut cmd = Command::new(python);
+    cmd.args(["-c", py_code]).current_dir(cwd);
+    run_command(cmd)
 }
 
 fn run_command(mut cmd: Command) -> Result<String, String> {
@@ -301,12 +306,6 @@ fn open_https_url(url: &str) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
-fn open_python_downloads() -> Result<String, String> {
-    open_https_url(PYTHON_DOWNLOAD_URL)?;
-    Ok(format!("已在浏览器中打开: {PYTHON_DOWNLOAD_URL}"))
-}
-
 /// 供前端说明区外链使用（WebView 默认不会打开 `target="_blank"`）。
 #[tauri::command]
 fn open_external_url(url: String) -> Result<String, String> {
@@ -321,9 +320,9 @@ struct SetupStatus {
     repo_root: Option<String>,
     data_dir: Option<String>,
     python: Option<String>,
-    /// 已有 venv 或本机存在可用于执行 `python3 -m venv` 的解释器
+    /// 已有 venv 或可用于创建 venv 的内置 Python
     python_usable_for_bootstrap: bool,
-    python_download_url: String,
+    embedded_python_available: bool,
     venv_exists: bool,
     deps_installed: bool,
     playwright_chromium_installed: bool,
@@ -356,14 +355,13 @@ with sync_playwright() as p:
 
 #[tauri::command]
 fn setup_check(app: tauri::AppHandle) -> SetupStatus {
-    let dl = PYTHON_DOWNLOAD_URL.to_string();
     let mut status = SetupStatus {
         ready: false,
         repo_root: None,
         data_dir: None,
         python: None,
         python_usable_for_bootstrap: false,
-        python_download_url: dl.clone(),
+        embedded_python_available: false,
         venv_exists: false,
         deps_installed: false,
         playwright_chromium_installed: false,
@@ -391,34 +389,39 @@ fn setup_check(app: tauri::AppHandle) -> SetupStatus {
     let managed_python = managed_python_path(&data_dir);
     status.venv_exists = managed_python.is_file();
 
-    let python_path: PathBuf = if status.venv_exists {
-        status.python_usable_for_bootstrap = true;
-        status.python = Some(managed_python.display().to_string());
-        managed_python
-    } else {
-        let Some(sys_py) = find_usable_bootstrap_python() else {
-            status.python_usable_for_bootstrap = false;
-            status.python = None;
-            status.message = python_missing_user_message();
-            return status;
-        };
-        status.python_usable_for_bootstrap = true;
-        status.python = Some(sys_py.display().to_string());
-        sys_py
-    };
+    let embedded_python = resolve_embedded_python(&app, &runtime_dir);
+    status.embedded_python_available = embedded_python.is_some();
+    status.python_usable_for_bootstrap = status.venv_exists || status.embedded_python_available;
 
-    status.deps_installed = check_python_deps(&python_path, &data_dir);
-    status.playwright_chromium_installed = check_playwright_chromium(&python_path, &data_dir);
+    if status.venv_exists {
+        status.python = Some(managed_python.display().to_string());
+    } else if let Some(ref embedded) = embedded_python {
+        status.python = Some(embedded.display().to_string());
+        if let Err(e) = check_embedded_python_usable(embedded, &data_dir) {
+            status.embedded_python_available = false;
+            status.python_usable_for_bootstrap = false;
+            status.message = format!("应用内置 Python 不可用（需 3.9+ 且包含 venv）：{e}");
+            return status;
+        }
+    } else {
+        status.message = embedded_python_missing_message();
+        return status;
+    }
+
+    if status.venv_exists {
+        status.deps_installed = check_python_deps(&managed_python, &data_dir);
+        status.playwright_chromium_installed = check_playwright_chromium(&managed_python, &data_dir);
+    }
     status.ready = status.venv_exists && status.deps_installed && status.playwright_chromium_installed;
 
     status.message = if status.ready {
-        "环境已就绪，可以直接启动服务。".to_string()
+        "环境已就绪，可以直接启动服务🎉".to_string()
     } else if !status.venv_exists {
-        "本机 Python 可用于创建虚拟环境。请点击「安装依赖」安装依赖与 Chromium。".to_string()
+        "点击【启动服务】将自动创建环境并安装依赖，完成后即可正常使用。".to_string()
     } else if !status.deps_installed {
-        "虚拟环境存在，但依赖未安装完整，建议点击「安装依赖」。".to_string()
+        "虚拟环境存在，但依赖未安装完整，启动服务时会自动安装。".to_string()
     } else {
-        "依赖已安装，但未检测到 Playwright Chromium，建议点击「安装依赖」。".to_string()
+        "依赖已安装，但未检测到 Playwright Chromium，启动服务时会自动下载安装。".to_string()
     };
     status
 }
@@ -433,9 +436,17 @@ async fn setup_install(app: tauri::AppHandle) -> Result<String, String> {
 fn setup_install_blocking(app: &tauri::AppHandle) -> Result<String, String> {
     let runtime_dir = resolve_runtime_dir(app)?;
     let data_dir = resolve_effective_data_dir(app, &runtime_dir)?;
+    let embedded_python = resolve_embedded_python(app, &runtime_dir)
+        .ok_or_else(embedded_python_missing_message)?;
     let mut logs: Vec<String> = Vec::new();
     logs.push(format!("运行时目录（只读）: {}", runtime_dir.display()));
     logs.push(format!("数据目录（可写）: {}", data_dir.display()));
+    logs.push(format!("内置 Python: {}", embedded_python.display()));
+    let py_probe = check_embedded_python_usable(&embedded_python, &data_dir)
+        .map_err(|e| format!("内置 Python 不可用（需 3.9+ 且包含 venv）：{e}"))?;
+    if !py_probe.is_empty() {
+        logs.push(format!("内置 Python 检测通过: {}", py_probe.replace('\n', " | ")));
+    }
 
     let req_file = runtime_dir.join("requirements.txt");
     if !req_file.is_file() {
@@ -447,9 +458,8 @@ fn setup_install_blocking(app: &tauri::AppHandle) -> Result<String, String> {
 
     let managed_python = managed_python_path(&data_dir);
     if !managed_python.is_file() {
-        let bootstrap = find_usable_bootstrap_python().ok_or_else(python_bootstrap_install_error)?;
-        logs.push(format!("使用系统 Python 创建虚拟环境: {}", bootstrap.display()));
-        let mut create_venv = Command::new(&bootstrap);
+        logs.push("使用内置 Python 创建虚拟环境...".to_string());
+        let mut create_venv = Command::new(&embedded_python);
         create_venv
             .args(["-m", "venv", MANAGED_VENV_DIR])
             .current_dir(&data_dir);
@@ -518,7 +528,6 @@ fn main() {
             service_open_log,
             setup_check,
             setup_install,
-            open_python_downloads,
             open_external_url,
             app_exit,
         ])

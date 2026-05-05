@@ -3,3 +3,13 @@ target
 dist
 .DS_Store
 src-tauri/bundled-runtime
+src-tauri/bundled-python
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Embedded Python runtime is large/binary; keep only docs scaffold
+bundled-python/*
+!bundled-python/README.md

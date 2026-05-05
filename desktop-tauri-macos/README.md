@@ -2,7 +2,7 @@
 
 这是一个 macOS 桌面壳，通过 `monitor_ctl.sh` 控制后台服务。
 
-**DMG 安装版**：应用包内自带 `monitor_tip.py`、`monitor_ctl.sh` 与 `requirements.txt`（构建时从仓库复制）。引导安装会把 **Python 虚拟环境、依赖与配置** 写到本机 `Application Support`，无需再拷贝整个仓库。每台 Mac 仍需本机已安装 **Python 3**（用于创建 venv）；Chromium 由 Playwright 下载到当前用户缓存目录。
+**DMG 安装版**：应用包内自带 `monitor_tip.py`、`monitor_ctl.sh`、`requirements.txt` 与最小 Python 运行时（`bundled-python`）。引导安装会把 **Python 虚拟环境、依赖与配置** 写到本机 `Application Support`，无需再拷贝整个仓库。首次点击「启动服务」时会自动检测环境并按需下载安装 Chromium。
 
 ## 功能
 
@@ -16,7 +16,16 @@
 - macOS 12+
 - Rust toolchain（`rustup`, `cargo`）— 仅开发与自行打包时需要
 - Node.js 18+ — 同上
-- **终端用户**：系统已安装 **Python 3**；首次在客户端内完成「引导安装」即可
+- **终端用户**：不需要系统 Python（由应用内置 `bundled-python` 提供）
+
+## 内置 Python 准备（打包前必做）
+
+将最小 Python 运行时放到：
+
+- `desktop-tauri-macos/bundled-python/bin/python3`
+
+构建脚本会将该目录复制到 `src-tauri/bundled-python` 并打入安装包。  
+发布构建（release）时若缺少 `bundled-python` 或缺少 `bin/python3` 会直接失败。
 
 ## 开发运行
 
@@ -53,3 +62,11 @@ npm run build
 ```bash
 export SUPERCHAT_PROJECT_DIR="/path/to/superchat-monitor"
 ```
+
+## 首次使用流程（终端用户）
+
+1. 打开应用，状态区会显示环境检测结果（内置 Python / venv / 依赖 / Chromium）。
+2. 点击「启动服务」：
+   - 若环境就绪：直接启动。
+   - 若环境未就绪：自动执行依赖与 Chromium 安装，并在状态区显示进度。
+3. 安装完成后自动启动服务，再点击「打开面板」访问 `http://localhost:17865`。

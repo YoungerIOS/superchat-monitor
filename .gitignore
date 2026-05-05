@@ -8,6 +8,7 @@ env/
 venv/
 ENV/
 .venv
+.venv-desktop/
 
 # IDE
 .vscode/
@@ -32,3 +33,6 @@ streamers.json
 *.bak
 
 superchat-monitor.pid
+
+# macOS desktop runtime data cache
+desktop-tauri-macos/src-tauri/target/
