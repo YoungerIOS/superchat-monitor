@@ -36,6 +36,93 @@ STREAMERS_FILE = (
     else "streamers.json"
 )
 
+# 主站点与镜像站点配置（默认以 stripchat 为主，兼容 superchat 镜像）
+def _normalize_site_origin(value: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if not text.startswith(("http://", "https://")):
+        text = f"https://{text}"
+    parsed = up.urlparse(text)
+    scheme = parsed.scheme or "https"
+    host = (parsed.netloc or parsed.path).strip().lower().rstrip("/")
+    return f"{scheme}://{host}" if host else ""
+
+
+def _parse_site_origins(raw: str) -> list[str]:
+    if not raw:
+        return []
+    parts = re.split(r"[,;\s]+", raw.strip())
+    out: list[str] = []
+    for part in parts:
+        site = _normalize_site_origin(part)
+        if site and site not in out:
+            out.append(site)
+    return out
+
+
+PRIMARY_SITE_ORIGIN = _normalize_site_origin(
+    os.getenv("SUPERCHAT_PRIMARY_SITE", "https://stripchat.com")
+) or "https://stripchat.com"
+FALLBACK_SITE_ORIGINS = _parse_site_origins(
+    os.getenv("SUPERCHAT_FALLBACK_SITES", "https://zh.superchat.live")
+)
+ALL_SITE_ORIGINS = [PRIMARY_SITE_ORIGIN] + [s for s in FALLBACK_SITE_ORIGINS if s != PRIMARY_SITE_ORIGIN]
+
+
+def get_site_candidates(preferred_origin: str | None = None) -> list[str]:
+    preferred = _normalize_site_origin(preferred_origin or "")
+    candidates: list[str] = []
+    if preferred:
+        candidates.append(preferred)
+    for site in ALL_SITE_ORIGINS:
+        if site not in candidates:
+            candidates.append(site)
+    return candidates
+
+
+def get_streamer_site_origin(username: str) -> str:
+    _, streamer = find_streamer_by_username(username)
+    if isinstance(streamer, dict):
+        site = _normalize_site_origin(str(streamer.get("site") or ""))
+        if site:
+            return site
+    state = ROOM_STATE.get(username) or {}
+    state_site = _normalize_site_origin(str(state.get("site_origin") or ""))
+    if state_site:
+        return state_site
+    api_url = state.get("api_url")
+    if isinstance(api_url, str) and api_url:
+        try:
+            parsed = up.urlparse(api_url)
+            if parsed.scheme and parsed.netloc:
+                return f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
+            pass
+    return PRIMARY_SITE_ORIGIN
+
+
+def build_room_url(site_origin: str, username: str) -> str:
+    return f"{site_origin.rstrip('/')}/{username}"
+
+
+def build_chat_api_url(site_origin: str, username: str, uniq: str) -> str:
+    return (
+        f"{site_origin.rstrip('/')}/api/front/v2/models/username/{username}/chat"
+        f"?source=regular&uniq={uniq}"
+    )
+
+
+def build_cam_api_url(site_origin: str, username: str) -> str:
+    return f"{site_origin.rstrip('/')}/api/front/v2/models/username/{username}/cam"
+
+
+def build_suggestion_api_url(site_origin: str, username: str, uniq: str) -> str:
+    return (
+        f"{site_origin.rstrip('/')}/api/front/v4/models/search/suggestion"
+        f"?query={username}&limit=10&primaryTag=girls&rcmGrp=A&oRcmGrp=A&uniq={uniq}"
+    )
+
 # 数据持久化函数
 def load_streamers():
     """从文件加载主播列表（字典格式）"""
@@ -383,215 +470,217 @@ def fetch_page_uniq_and_cookies(username: str, headless: bool = True, nav_timeou
     - nav_timeout: 页面导航超时时间（毫秒）
     - watch_time: 在页面加载后继续监听网络请求的时间（毫秒）
     """
-    home = f"https://zh.superchat.live/{username}"
-    print(f"[Playwright] 打开页面获取 uniq: {home} (nav_timeout={nav_timeout}ms, watch_time={watch_time}ms)")
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless)
-            context = browser.new_context()
-            page = context.new_page()
+    preferred_site = get_streamer_site_origin(username)
+    site_candidates = get_site_candidates(preferred_site)
+    last_error = ""
+    for site_origin in site_candidates:
+        home = build_room_url(site_origin, username)
+        print(
+            f"[Playwright] 打开页面获取 uniq: {home} "
+            f"(nav_timeout={nav_timeout}ms, watch_time={watch_time}ms)"
+        )
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless)
+                context = browser.new_context()
+                page = context.new_page()
 
-            found = {"url": None}
-            captured_urls: list[str] = []
+                found = {"url": None}
+                captured_urls: list[str] = []
 
-            # 回调：记录所有请求 URL，查找匹配的 chat 请求
-            def on_request(req):
+                def on_request(req):
+                    try:
+                        url = req.url
+                        if "uniq" in url.lower():
+                            captured_urls.append(url)
+                        if "/api/front/v2/models/username/" in url and "uniq" in url.lower():
+                            if not found["url"]:
+                                found["url"] = url
+                                print(f"[Playwright] 捕获到 chat 请求 URL: {url}")
+                    except Exception:
+                        pass
+
+                page.on("request", on_request)
+                page.goto(home, timeout=nav_timeout, wait_until="domcontentloaded")
                 try:
-                    url = req.url
-                    if "uniq" in url.lower():
-                        captured_urls.append(url)
-                    if "/api/front/v2/models/username/" in url and "uniq" in url.lower():
-                        if not found["url"]:
-                            found["url"] = url
-                            print(f"[Playwright] 捕获到 chat 请求 URL: {url}")
+                    page.wait_for_load_state("networkidle", timeout=8000)
                 except Exception:
                     pass
+                if watch_time > 0:
+                    page.wait_for_timeout(watch_time)
 
-            page.on("request", on_request)
+                uniq = None
+                uniq_source = None
+                api_url = None
+                actual_username = None
+                if found["url"]:
+                    parsed = up.urlparse(found["url"])
+                    path_parts = parsed.path.split('/')
+                    try:
+                        username_idx = path_parts.index('username')
+                        if username_idx >= 0 and username_idx + 1 < len(path_parts):
+                            actual_username = path_parts[username_idx + 1]
+                    except ValueError:
+                        pass
 
-            # 导航并等待基本加载
-            # 该站点常见情况是页面资源/长连接导致 "load" 久等不返回，
-            # 用 domcontentloaded 能显著降低超时概率，同时不影响我们监听 XHR 来抓 uniq。
-            page.goto(home, timeout=nav_timeout, wait_until="domcontentloaded")
-            # 等待 networkidle，之后再继续监听一段时间（以便捕获动态 XHR）
-            try:
-                page.wait_for_load_state("networkidle", timeout=8000)
-            except Exception:
-                # networkidle 可能超时，但不用失败，继续监听
-                pass
-
-            # 继续监听短时间以捕获稍后发起的请求（例如异步 XHR）
-            # watch_time 毫秒
-            if watch_time > 0:
-                page.wait_for_timeout(watch_time)
-
-            # 如果在请求监听期间捕获到 URL，直接解析 uniq 和实际用户名
-            uniq = None
-            uniq_source = None
-            api_url = None
-            actual_username = None
-            if found["url"]:
-                parsed = up.urlparse(found["url"])
-                # 从 URL 路径中提取实际用户名：/api/front/v2/models/username/{actual_username}/chat
-                path_parts = parsed.path.split('/')
-                try:
-                    username_idx = path_parts.index('username')
-                    if username_idx >= 0 and username_idx + 1 < len(path_parts):
-                        actual_username = path_parts[username_idx + 1]
-                except ValueError:
-                    pass
-                
-                qs = up.parse_qs(parsed.query)
-                uvals = qs.get("uniq") or qs.get("uniq[]") or []
-                if uvals:
-                    uniq = _sanitize_uniq_candidate(uvals[0])
-                    uniq_source = "network-request"
-                    api_url = found["url"]
-                else:
-                    m = re.search(r"uniq=([A-Za-z0-9_-]+)", found["url"], re.IGNORECASE)
-                    if m:
-                        uniq = _sanitize_uniq_candidate(m.group(1))
-                        uniq_source = "network-request-regex"
+                    qs = up.parse_qs(parsed.query)
+                    uvals = qs.get("uniq") or qs.get("uniq[]") or []
+                    if uvals:
+                        uniq = _sanitize_uniq_candidate(uvals[0])
+                        uniq_source = "network-request"
                         api_url = found["url"]
+                    else:
+                        m = re.search(r"uniq=([A-Za-z0-9_-]+)", found["url"], re.IGNORECASE)
+                        if m:
+                            uniq = _sanitize_uniq_candidate(m.group(1))
+                            uniq_source = "network-request-regex"
+                            api_url = found["url"]
 
-            if not uniq and captured_urls:
-                for entry in captured_urls:
-                    m = re.search(r"uniq=([A-Za-z0-9_-]+)", entry, re.IGNORECASE)
-                    if not m:
-                        continue
-                    candidate = _sanitize_uniq_candidate(m.group(1))
-                    if candidate:
-                        uniq = candidate
-                        uniq_source = "captured-request"
-                        break
-
-            # 如果没在请求中找到，再回退到页面 HTML 中查找
-            html = page.content()
-            if not uniq:
-                uniq_from_html = extract_uniq_from_html(username, html)
-                if uniq_from_html:
-                    uniq = uniq_from_html
-                    uniq_source = "page-html"
-                    print(f"[Playwright] 在 HTML 中提取到 uniq={uniq}")
-            # 从 Nuxt 数据、脚本等再尝试提取一次（仅用于 uniq 回退，不再依赖其中的用户名字段）
-            if not uniq:
-                try:
-                    nuxt_snapshot = page.evaluate("""() => {
-                        const root = window.__NUXT__ || null;
-                        if (!root) {
-                            return null;
-                        }
-                        try {
-                            return JSON.stringify(root);
-                        } catch (err) {
-                            return null;
-                        }
-                    }""")
-                except Exception:
-                    nuxt_snapshot = None
-                if nuxt_snapshot and not uniq:
-                    uniq_from_nuxt = extract_uniq_from_html(username, nuxt_snapshot)
-                    if uniq_from_nuxt:
-                        uniq = uniq_from_nuxt
-                        uniq_source = "nuxt-state"
-                        print(f"[Playwright] 在 __NUXT__ 数据中提取到 uniq={uniq}")
-
-            if not uniq:
-                try:
-                    nuxt_data_script = page.evaluate("""() => {
-                        const el = document.querySelector('script[id="__NUXT_DATA__"]');
-                        return el ? el.textContent : null;
-                    }""")
-                except Exception:
-                    nuxt_data_script = None
-                if nuxt_data_script:
-                    uniq_from_script = extract_uniq_from_html(username, nuxt_data_script)
-                    if uniq_from_script:
-                        uniq = uniq_from_script
-                        uniq_source = "nuxt-data-script"
-                        print(f"[Playwright] 在 __NUXT_DATA__ 中提取到 uniq={uniq}")
-
-            storage_snapshots: list[dict[str, str]] = []
-            if not uniq:
-                try:
-                    local_storage = page.evaluate("""() => {
-                        if (!window.localStorage) { return null; }
-                        const data = {};
-                        for (let i = 0; i < localStorage.length; i++) {
-                            const key = localStorage.key(i);
-                            data[key] = localStorage.getItem(key);
-                        }
-                        return data;
-                    }""")
-                    if isinstance(local_storage, dict):
-                        storage_snapshots.append(local_storage)
-                except Exception:
-                    pass
-                try:
-                    session_storage = page.evaluate("""() => {
-                        if (!window.sessionStorage) { return null; }
-                        const data = {};
-                        for (let i = 0; i < sessionStorage.length; i++) {
-                            const key = sessionStorage.key(i);
-                            data[key] = sessionStorage.getItem(key);
-                        }
-                        return data;
-                    }""")
-                    if isinstance(session_storage, dict):
-                        storage_snapshots.append(session_storage)
-                except Exception:
-                    pass
-                for snapshot in storage_snapshots:
-                    if not snapshot:
-                        continue
-                    for key, value in snapshot.items():
-                        if key and "uniq" in key.lower():
-                            candidate = _sanitize_uniq_candidate(value)
-                            if candidate:
-                                uniq = candidate
-                                uniq_source = f"storage:{key}"
-                                print(f"[Playwright] 在 storage {key} 中提取到 uniq={uniq}")
-                                break
-                    if uniq:
-                        break
-
-            # 导出 cookie 与 UA
-            cookies = context.cookies()
-            cookie_dict = {c['name']: c['value'] for c in cookies}
-            if not uniq:
-                for c in cookies:
-                    name = c.get('name', '')
-                    if name and 'uniq' in name.lower():
-                        candidate = _sanitize_uniq_candidate(c.get('value'))
+                if not uniq and captured_urls:
+                    for entry in captured_urls:
+                        m = re.search(r"uniq=([A-Za-z0-9_-]+)", entry, re.IGNORECASE)
+                        if not m:
+                            continue
+                        candidate = _sanitize_uniq_candidate(m.group(1))
                         if candidate:
                             uniq = candidate
-                            uniq_source = f"cookie:{name}"
-                            print(f"[Playwright] 在 Cookie {name} 中提取到 uniq={uniq}")
+                            uniq_source = "captured-request"
                             break
-            try:
-                ua = page.evaluate("() => navigator.userAgent")
-            except Exception:
-                ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36"
-            
-            browser.close()
 
-            final_username = actual_username or username
-            if uniq and not api_url:
-                api_url = f"https://zh.superchat.live/api/front/v2/models/username/{final_username}/chat?source=regular&uniq={uniq}"
+                html = page.content()
+                if not uniq:
+                    uniq_from_html = extract_uniq_from_html(username, html)
+                    if uniq_from_html:
+                        uniq = uniq_from_html
+                        uniq_source = "page-html"
+                        print(f"[Playwright] 在 HTML 中提取到 uniq={uniq}")
+                if not uniq:
+                    try:
+                        nuxt_snapshot = page.evaluate("""() => {
+                            const root = window.__NUXT__ || null;
+                            if (!root) {
+                                return null;
+                            }
+                            try {
+                                return JSON.stringify(root);
+                            } catch (err) {
+                                return null;
+                            }
+                        }""")
+                    except Exception:
+                        nuxt_snapshot = None
+                    if nuxt_snapshot and not uniq:
+                        uniq_from_nuxt = extract_uniq_from_html(username, nuxt_snapshot)
+                        if uniq_from_nuxt:
+                            uniq = uniq_from_nuxt
+                            uniq_source = "nuxt-state"
+                            print(f"[Playwright] 在 __NUXT__ 数据中提取到 uniq={uniq}")
 
-            if uniq:
-                print(f"[Playwright] 成功获取 uniq={uniq}，cookies_keys={list(cookie_dict.keys())}，来源={uniq_source or 'unknown'}")
-                if actual_username and actual_username != username:
-                    print(f"[Playwright] ⚠️ 检测到用户名变更: {username} -> {actual_username}")
-            else:
-                print(f"[Playwright] 未提取到 uniq（network requests 和 HTML 均无），已抓取 {len(cookie_dict)} 个 cookie")
+                if not uniq:
+                    try:
+                        nuxt_data_script = page.evaluate("""() => {
+                            const el = document.querySelector('script[id="__NUXT_DATA__"]');
+                            return el ? el.textContent : null;
+                        }""")
+                    except Exception:
+                        nuxt_data_script = None
+                    if nuxt_data_script:
+                        uniq_from_script = extract_uniq_from_html(username, nuxt_data_script)
+                        if uniq_from_script:
+                            uniq = uniq_from_script
+                            uniq_source = "nuxt-data-script"
+                            print(f"[Playwright] 在 __NUXT_DATA__ 中提取到 uniq={uniq}")
 
-            return uniq, cookie_dict, ua, html, actual_username
+                storage_snapshots: list[dict[str, str]] = []
+                if not uniq:
+                    try:
+                        local_storage = page.evaluate("""() => {
+                            if (!window.localStorage) { return null; }
+                            const data = {};
+                            for (let i = 0; i < localStorage.length; i++) {
+                                const key = localStorage.key(i);
+                                data[key] = localStorage.getItem(key);
+                            }
+                            return data;
+                        }""")
+                        if isinstance(local_storage, dict):
+                            storage_snapshots.append(local_storage)
+                    except Exception:
+                        pass
+                    try:
+                        session_storage = page.evaluate("""() => {
+                            if (!window.sessionStorage) { return null; }
+                            const data = {};
+                            for (let i = 0; i < sessionStorage.length; i++) {
+                                const key = sessionStorage.key(i);
+                                data[key] = sessionStorage.getItem(key);
+                            }
+                            return data;
+                        }""")
+                        if isinstance(session_storage, dict):
+                            storage_snapshots.append(session_storage)
+                    except Exception:
+                        pass
+                    for snapshot in storage_snapshots:
+                        if not snapshot:
+                            continue
+                        for key, value in snapshot.items():
+                            if key and "uniq" in key.lower():
+                                candidate = _sanitize_uniq_candidate(value)
+                                if candidate:
+                                    uniq = candidate
+                                    uniq_source = f"storage:{key}"
+                                    print(f"[Playwright] 在 storage {key} 中提取到 uniq={uniq}")
+                                    break
+                        if uniq:
+                            break
 
-    except Exception as e:
-        err = f"ERROR in playwright fetch: {e}"
-        print(err)
-        return None, {}, "", err, None
+                cookies = context.cookies()
+                cookie_dict = {c['name']: c['value'] for c in cookies}
+                if not uniq:
+                    for c in cookies:
+                        name = c.get('name', '')
+                        if name and 'uniq' in name.lower():
+                            candidate = _sanitize_uniq_candidate(c.get('value'))
+                            if candidate:
+                                uniq = candidate
+                                uniq_source = f"cookie:{name}"
+                                print(f"[Playwright] 在 Cookie {name} 中提取到 uniq={uniq}")
+                                break
+                try:
+                    ua = page.evaluate("() => navigator.userAgent")
+                except Exception:
+                    ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36"
+
+                browser.close()
+                final_username = actual_username or username
+                if uniq and not api_url:
+                    api_url = build_chat_api_url(site_origin, final_username, uniq)
+
+                if uniq:
+                    print(
+                        f"[Playwright] 成功获取 uniq={uniq}，"
+                        f"cookies_keys={list(cookie_dict.keys())}，来源={uniq_source or 'unknown'}"
+                    )
+                    if actual_username and actual_username != username:
+                        print(f"[Playwright] ⚠️ 检测到用户名变更: {username} -> {actual_username}")
+                    state = ROOM_STATE.get(username) or {}
+                    state["site_origin"] = site_origin
+                    ROOM_STATE[username] = state
+                    if actual_username and actual_username != username:
+                        new_state = ROOM_STATE.get(actual_username) or {}
+                        new_state["site_origin"] = site_origin
+                        ROOM_STATE[actual_username] = new_state
+                else:
+                    print(f"[Playwright] 未提取到 uniq（network requests 和 HTML 均无），已抓取 {len(cookie_dict)} 个 cookie")
+
+                return uniq, cookie_dict, ua, html, actual_username
+        except Exception as e:
+            err = f"ERROR in playwright fetch ({site_origin}): {e}"
+            last_error = err
+            print(err)
+            continue
+    return None, {}, "", (last_error or "ERROR in playwright fetch: no site candidates"), None
 
 
 # ---------- 通过官方接口提取菜单（优先方案） ----------
@@ -626,15 +715,16 @@ def fetch_tip_menu_via_api(username: str, nav_timeout: int = 30000) -> Dict[str,
             "uniq": uniq
         }
 
+        site_origin = get_streamer_site_origin(username)
         headers = {
             "User-Agent": ua,
             "Accept": "application/json, text/plain, */*",
-            "Referer": f"https://zh.superchat.live/{username}"
+            "Referer": build_room_url(site_origin, username)
         }
         if cookies:
             headers["Cookie"] = "; ".join([f"{k}={v}" for k, v in cookies.items()])
 
-        base_url = f"https://zh.superchat.live/api/front/v2/models/username/{username}/cam"
+        base_url = build_cam_api_url(site_origin, username)
         proxies = {"http": PROXY, "https": PROXY} if PROXY else None
 
         try:
@@ -693,23 +783,27 @@ def fetch_tip_menu_via_api(username: str, nav_timeout: int = 30000) -> Dict[str,
 
 
 # ---------- 在线状态检测（基于搜索/suggestion API） ----------
-async def check_online_status_via_search(session: aiohttp.ClientSession, username: str, cookies: Dict[str, str], ua: str, uniq: str) -> bool | None:
+async def check_online_status_via_search(
+    session: aiohttp.ClientSession,
+    username: str,
+    cookies: Dict[str, str],
+    ua: str,
+    uniq: str,
+    site_origin: str,
+) -> bool | None:
     """
     通过搜索 suggestion API 检查主播在线状态。
     返回 True(在线) / False(离线) / None(无法确定)
     """
     try:
         # 构建 suggestion API URL
-        suggestion_url = (
-            f"https://zh.superchat.live/api/front/v4/models/search/suggestion"
-            f"?query={username}&limit=10&primaryTag=girls&rcmGrp=A&oRcmGrp=A&uniq={uniq}"
-        )
+        suggestion_url = build_suggestion_api_url(site_origin, username, uniq)
         
         cookie_header = "; ".join([f"{k}={v}" for k, v in cookies.items()])
         headers = {
             "User-Agent": ua,
             "Accept": "application/json, text/plain, */*",
-            "Referer": "https://zh.superchat.live/",
+            "Referer": f"{site_origin.rstrip('/')}/",
             "Cookie": cookie_header,
         }
         
@@ -850,11 +944,13 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
                         username_changed = True
                         print(f"[{username}] 已更新配置和状态，设置为低频模式等待下次刷新")
                 
-                api_url = f"https://zh.superchat.live/api/front/v2/models/username/{username}/chat?source=regular&uniq={uniq}"
+                site_origin = get_streamer_site_origin(username)
+                api_url = build_chat_api_url(site_origin, username, uniq)
                 ROOM_STATE[username] = {
                     "api_url": api_url, 
                     "cookies": cookies, 
                     "ua": ua, 
+                    "site_origin": site_origin,
                     "last_refresh": time.time(),
                     "online_status": None,
                     "last_status_check": 0,
@@ -880,7 +976,7 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
             headers = {
                 "User-Agent": ua,
                 "Accept": "application/json, text/plain, */*",
-                "Referer": f"https://zh.superchat.live/{username}",
+                "Referer": build_room_url(get_streamer_site_origin(username), username),
                 "Cookie": cookie_header,
             }
 
@@ -909,13 +1005,15 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
                                 username_changed = True
                                 print(f"[{username}] 已更新配置和状态，继续正常轮询")
                         
-                        new_api = f"https://zh.superchat.live/api/front/v2/models/username/{username}/chat?source=regular&uniq={uniq}"
+                        site_origin = get_streamer_site_origin(username)
+                        new_api = build_chat_api_url(site_origin, username, uniq)
                         # 保留现有状态，只更新 uniq 相关字段
                         old_state = ROOM_STATE.get(username, {})
                         ROOM_STATE[username] = {
                             "api_url": new_api, 
                             "cookies": cookies, 
                             "ua": ua, 
+                            "site_origin": site_origin,
                             "last_refresh": time.time(),
                             "online_status": old_state.get("online_status"),
                             "last_status_check": old_state.get("last_status_check", 0),
@@ -967,10 +1065,12 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
                                     print(f"[{username}] 已更新配置和状态，继续正常轮询")
                             
                             old_state = ROOM_STATE.get(username, {})
+                            site_origin = get_streamer_site_origin(username)
                             ROOM_STATE[username] = {
-                                "api_url": f"https://zh.superchat.live/api/front/v2/models/username/{username}/chat?source=regular&uniq={uniq}", 
+                                "api_url": build_chat_api_url(site_origin, username, uniq), 
                                 "cookies": cookies, 
                                 "ua": ua, 
+                                "site_origin": site_origin,
                                 "last_refresh": time.time(),
                                 "online_status": old_state.get("online_status"),
                                 "last_status_check": old_state.get("last_status_check", 0),
@@ -1418,7 +1518,14 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
                         state["uniq"] = uniq  # 保存到 state 中
                 
                 if uniq:
-                    new_status = await check_online_status_via_search(session, username, cookies, ua, uniq)
+                    new_status = await check_online_status_via_search(
+                        session,
+                        username,
+                        cookies,
+                        ua,
+                        uniq,
+                        get_streamer_site_origin(username),
+                    )
                     old_status = state.get("online_status")
                     # 状态检查已完成，保持已更新的时间戳
                     state["status_loading"] = False
@@ -2319,7 +2426,7 @@ def build_streamer_row(streamer: dict):
         cfg_btn = ui.button('配置', on_click=open_config).classes('q-btn--outline q-btn--no-uppercase whitespace-nowrap').style('width:11%')
 
         def copy_room_url():
-            url = f"https://zh.superchat.live/{username}"
+            url = build_room_url(get_streamer_site_origin(username), username)
             try:
                 # 在 macOS 上直接写入系统剪贴板，避免浏览器权限限制
                 subprocess.run(["pbcopy"], input=url, text=True, check=True)
@@ -2331,7 +2438,7 @@ def build_streamer_row(streamer: dict):
         copy_btn = ui.button('复制网址', on_click=copy_room_url).classes('q-btn--outline q-btn--no-uppercase whitespace-nowrap').style('width:11%')
 
         def open_room():
-            url = f"https://zh.superchat.live/{username}"
+            url = build_room_url(get_streamer_site_origin(username), username)
             ui.run_javascript(f'window.open("{url}", "_blank")')
 
         open_btn = ui.button('进入直播间', on_click=open_room).classes('q-btn--outline q-btn--no-uppercase whitespace-nowrap').style('width:11%')
@@ -2809,7 +2916,7 @@ def build_ui():
             delete_btn = ui.button('', on_click=toggle_delete_mode).props('icon=delete flat color=grey-7').style('min-width:auto; width:auto; height:auto; padding:0 4px')
         
         # 中间：标题（居中）
-        ui.label('SuperChat 多房间监控').classes('text-h5 absolute left-1/2 transform -translate-x-1/2')
+        ui.label('XChat Monitor').classes('text-h5 absolute left-1/2 transform -translate-x-1/2')
         
         # 右侧：全部开启/关闭按钮
         with ui.row().classes('items-center gap-2'):
@@ -2957,12 +3064,13 @@ async def poll_superchat(username: str):
     if not uniq:
         print(f"[{username}] 未能通过 Playwright 获取 uniq，退出演示。")
         return
-    api_url = f"https://zh.superchat.live/api/front/v2/models/username/{username}/chat?source=regular&uniq={uniq}"
+    site_origin = get_streamer_site_origin(username)
+    api_url = build_chat_api_url(site_origin, username, uniq)
     cookie_header = "; ".join([f"{k}={v}" for k, v in cookies.items()])
     headers = {
         "User-Agent": ua or "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
-        "Referer": f"https://zh.superchat.live/{username}",
+        "Referer": build_room_url(site_origin, username),
         "Cookie": cookie_header,
     }
 

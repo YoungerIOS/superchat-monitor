@@ -35,8 +35,19 @@ python -m playwright install chromium
 ## 配置和运行
 
 1. 在 `monitor_tip.py` 中配置代理PROXY（如需要）
-2. 推荐用控制脚本启动：`./monitor_ctl.sh start --open`
-3. 或直接运行：`python monitor_tip.py`
+2. 可选：通过环境变量配置主监控站点与镜像回退（默认主站是 `stripchat.com`，回退 `zh.superchat.live`）
+3. 推荐用控制脚本启动：`./monitor_ctl.sh start --open`
+4. 或直接运行：`python monitor_tip.py`
+
+站点配置示例：
+
+```bash
+# 主监控站（默认值已是 stripchat.com）
+export SUPERCHAT_PRIMARY_SITE="https://stripchat.com"
+
+# 回退镜像站（可多个，用逗号或空格分隔）
+export SUPERCHAT_FALLBACK_SITES="https://zh.superchat.live,https://your-mirror.example"
+```
 
 ## 使用说明
 

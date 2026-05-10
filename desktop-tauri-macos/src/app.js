@@ -88,17 +88,18 @@ function boolIcon(value) {
 function formatSetupStatus(status) {
   const boot = status?.pythonUsableForBootstrap;
   const message = status?.message ? String(status.message).replace(/\s*\n+\s*/g, ' / ') : '';
-  const lines = [
+  const lines = [];
+  if (message) {
+    lines.push(`提示: ${message}`);
+    lines.push(DOT_DIVIDER);
+  }
+  lines.push(
     `环境就绪: ${boolIcon(Boolean(status?.ready))}`,
-    `检测到 Python: ${boot === true ? '✅' : boot === false ? '❌' : '❌'}`,
-    `虚拟环境(.venv-desktop): ${boolIcon(Boolean(status?.venvExists))}`,
+    `Python: ${boot === true ? '✅' : boot === false ? '❌' : '❌'}`,
+    `虚拟环境: ${boolIcon(Boolean(status?.venvExists))}`,
     `依赖安装: ${boolIcon(Boolean(status?.depsInstalled))}`,
     `Playwright Chromium: ${boolIcon(Boolean(status?.playwrightChromiumInstalled))}`,
-  ];
-  if (message) {
-    lines.push(DOT_DIVIDER);
-    lines.push(`提示: ${message}`);
-  }
+  );
   return lines;
 }
 
