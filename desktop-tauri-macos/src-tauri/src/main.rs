@@ -18,11 +18,15 @@ fn managed_python_path(data_dir: &Path) -> PathBuf {
     data_dir.join(MANAGED_VENV_DIR).join("bin").join("python3")
 }
 
+fn project_venv_python_path(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join(".venv").join("bin").join("python")
+}
+
 fn embedded_python_missing_message() -> String {
     "未检测到应用内置 Python 运行时（bundled-python）。请重新安装应用或联系开发者。".to_string()
 }
 
-fn resolve_embedded_python(app: &tauri::AppHandle, runtime_dir: &Path) -> Option<PathBuf> {
+fn resolve_embedded_python(app: &tauri::AppHandle, _runtime_dir: &Path) -> Option<PathBuf> {
     if let Ok(custom) = env::var("SUPERCHAT_EMBEDDED_PYTHON") {
         let path = PathBuf::from(custom);
         if path.is_file() {
@@ -40,7 +44,7 @@ fn resolve_embedded_python(app: &tauri::AppHandle, runtime_dir: &Path) -> Option
     // 开发模式：允许从仓库内预置的 bundled-python 调试。
     #[cfg(debug_assertions)]
     {
-        let dev_candidate = runtime_dir
+        let dev_candidate = _runtime_dir
             .join("desktop-tauri-macos")
             .join("src-tauri")
             .join(EMBEDDED_PYTHON_RELATIVE);
@@ -226,6 +230,7 @@ fn run_ctl(app: &tauri::AppHandle, args: &[&str]) -> Result<String, String> {
     let data_dir = resolve_effective_data_dir(app, &runtime_dir)?;
     let script = runtime_dir.join("monitor_ctl.sh");
     let managed_python = managed_python_path(&data_dir);
+    let project_python = project_venv_python_path(&runtime_dir);
 
     let mut cmd = Command::new("/bin/bash");
     cmd.arg(script)
@@ -235,6 +240,8 @@ fn run_ctl(app: &tauri::AppHandle, args: &[&str]) -> Result<String, String> {
         .env("SUPERCHAT_DATA_DIR", &data_dir);
     if managed_python.is_file() {
         cmd.env("SUPERCHAT_PYTHON", managed_python);
+    } else if project_python.is_file() {
+        cmd.env("SUPERCHAT_PYTHON", project_python);
     }
     run_command(cmd)
 }
@@ -333,7 +340,7 @@ fn check_python_deps(python: &Path, cwd: &Path) -> bool {
     let mut cmd = Command::new(python);
     cmd.args([
         "-c",
-        "import aiohttp,aiohttp_socks,nicegui,playwright,requests;print('ok')",
+        "import aiohttp,aiohttp_socks,certifi,nicegui,playwright,requests;print('ok')",
     ])
     .current_dir(cwd);
     run_command(cmd).is_ok()
@@ -387,14 +394,22 @@ fn setup_check(app: tauri::AppHandle) -> SetupStatus {
     status.data_dir = Some(data_dir.display().to_string());
 
     let managed_python = managed_python_path(&data_dir);
-    status.venv_exists = managed_python.is_file();
+    let project_python = project_venv_python_path(&runtime_dir);
+    let active_venv_python = if managed_python.is_file() {
+        Some(managed_python.clone())
+    } else if project_python.is_file() {
+        Some(project_python.clone())
+    } else {
+        None
+    };
+    status.venv_exists = active_venv_python.is_some();
 
     let embedded_python = resolve_embedded_python(&app, &runtime_dir);
     status.embedded_python_available = embedded_python.is_some();
     status.python_usable_for_bootstrap = status.venv_exists || status.embedded_python_available;
 
-    if status.venv_exists {
-        status.python = Some(managed_python.display().to_string());
+    if let Some(ref python) = active_venv_python {
+        status.python = Some(python.display().to_string());
     } else if let Some(ref embedded) = embedded_python {
         status.python = Some(embedded.display().to_string());
         if let Err(e) = check_embedded_python_usable(embedded, &data_dir) {
@@ -408,9 +423,9 @@ fn setup_check(app: tauri::AppHandle) -> SetupStatus {
         return status;
     }
 
-    if status.venv_exists {
-        status.deps_installed = check_python_deps(&managed_python, &data_dir);
-        status.playwright_chromium_installed = check_playwright_chromium(&managed_python, &data_dir);
+    if let Some(ref python) = active_venv_python {
+        status.deps_installed = check_python_deps(python, &data_dir);
+        status.playwright_chromium_installed = check_playwright_chromium(python, &data_dir);
     }
     status.ready = status.venv_exists && status.deps_installed && status.playwright_chromium_installed;
 

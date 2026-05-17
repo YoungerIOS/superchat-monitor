@@ -1,5 +1,7 @@
-# Python
+# Python (uv: commit pyproject.toml + uv.lock; ignore local venv)
 __pycache__/
+.python-version
+**/.bundle-copy.lock
 *.py[cod]
 *$py.class
 *.so

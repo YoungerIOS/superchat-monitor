@@ -27,9 +27,11 @@
 
 ## 安装依赖
 
+推荐使用 `uv` 管理本项目环境，避免受到本机 `pyenv` 或全局 Python 影响：
+
 ```bash
-pip install playwright aiohttp aiohttp-socks requests nicegui
-python -m playwright install chromium
+uv sync --managed-python
+uv run python -m playwright install chromium
 ```
 
 ## 配置和运行
@@ -37,7 +39,9 @@ python -m playwright install chromium
 1. 在 `monitor_tip.py` 中配置代理PROXY（如需要）
 2. 可选：通过环境变量配置主监控站点与镜像回退（默认主站是 `stripchat.com`，回退 `zh.superchat.live`）
 3. 推荐用控制脚本启动：`./monitor_ctl.sh start --open`
-4. 或直接运行：`python monitor_tip.py`
+4. 或直接运行：`uv run python monitor_tip.py`
+
+控制脚本会优先使用项目内的 `.venv/bin/python`。如果尚未创建 `.venv`，请先执行 `uv sync --managed-python`。
 
 站点配置示例：
 

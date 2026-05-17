@@ -38,16 +38,12 @@ resolve_python() {
     printf '%s\n' "$SUPERCHAT_PYTHON"
     return
   fi
-  local pyenv_candidate="$HOME/.pyenv/versions/chat-site-tracking/bin/python"
-  if [[ -x "$pyenv_candidate" ]]; then
-    printf '%s\n' "$pyenv_candidate"
+  local uv_venv_python="$APP_DIR/.venv/bin/python"
+  if [[ -x "$uv_venv_python" ]]; then
+    printf '%s\n' "$uv_venv_python"
     return
   fi
-  if command -v python3 >/dev/null 2>&1; then
-    command -v python3
-    return
-  fi
-  echo "未找到 Python：请安装 python3 或设置环境变量 SUPERCHAT_PYTHON" >&2
+  echo "未找到项目 Python：请先在项目目录执行 uv sync，或设置 SUPERCHAT_PYTHON" >&2
   exit 1
 }
 

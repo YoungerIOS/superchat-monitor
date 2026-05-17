@@ -10,7 +10,7 @@ multi_room_monitor_playwright.py
   python -m playwright install chromium
 """
 
-import asyncio, re, os, time, json, subprocess
+import asyncio, re, os, ssl, time, json, subprocess
 import urllib.parse as up
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
@@ -23,10 +23,42 @@ import requests
 # 进而触发 driver 通信异常（如 write EPIPE）。这里主动清理以提升稳定性。
 os.environ.pop("PLAYWRIGHT_NODEJS_PATH", None)
 
+
+def _configure_trusted_ca_bundle() -> str | None:
+    """Bundled Python.org runtimes often lack a CA bundle; certifi fixes aiohttp/requests TLS."""
+    existing = (os.environ.get("SSL_CERT_FILE") or "").strip()
+    if existing and os.path.isfile(existing):
+        return existing
+    try:
+        import certifi
+    except ImportError:
+        return None
+    cafile = certifi.where()
+    for key in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        if not (os.environ.get(key) or "").strip():
+            os.environ[key] = cafile
+    return cafile
+
+
+_CA_BUNDLE_PATH = _configure_trusted_ca_bundle()
+
 from playwright.sync_api import sync_playwright
 from nicegui import ui, app
 
 PROXY = ""  # v2rayN 的本地 SOCKS5 代理端口
+
+
+def _aiohttp_ssl_param() -> ssl.SSLContext | bool:
+    if _CA_BUNDLE_PATH:
+        return ssl.create_default_context(cafile=_CA_BUNDLE_PATH)
+    return True
+
+
+def make_aiohttp_connector():
+    ssl_param = _aiohttp_ssl_param()
+    if PROXY:
+        return ProxyConnector.from_url(PROXY, ssl=ssl_param)
+    return aiohttp.TCPConnector(ssl=ssl_param)
 
 # ---------- 配置区 ----------
 _SUPERCHAT_DATA = os.environ.get("SUPERCHAT_DATA_DIR", "").strip()
@@ -1671,8 +1703,7 @@ async def poll_room(session: aiohttp.ClientSession, username: str):
 async def ensure_session() -> aiohttp.ClientSession:
     global ASYNC_SESSION
     if ASYNC_SESSION is None or ASYNC_SESSION.closed:
-        connector = ProxyConnector.from_url(PROXY) if PROXY else None
-        ASYNC_SESSION = aiohttp.ClientSession(connector=connector)
+        ASYNC_SESSION = aiohttp.ClientSession(connector=make_aiohttp_connector())
     return ASYNC_SESSION
 
 
@@ -3074,8 +3105,7 @@ async def poll_superchat(username: str):
         "Cookie": cookie_header,
     }
 
-    connector = ProxyConnector.from_url(PROXY) if PROXY else None
-    async with aiohttp.ClientSession(connector=connector) as session:
+    async with aiohttp.ClientSession(connector=make_aiohttp_connector()) as session:
         async with session.get(api_url, headers=headers, timeout=15) as resp:
             print(f"[{username}] 状态码:", resp.status)
             text_ct = resp.headers.get("Content-Type","")
@@ -3089,14 +3119,13 @@ async def poll_superchat(username: str):
 
 async def main():
     # 多房间异步轮询：共享一个会话与代理，分别跑每个主播
-    connector = ProxyConnector.from_url(PROXY) if PROXY else None
-    async with aiohttp.ClientSession(connector=connector) as session:
+    async with aiohttp.ClientSession(connector=make_aiohttp_connector()) as session:
         tasks = [asyncio.create_task(poll_room(session, get_streamer_username(streamer))) 
                  for streamer in STREAMERS if get_streamer_username(streamer)]
         await asyncio.gather(*tasks)
 
 
-if __name__ == "__main__":
+def run():
     build_ui()
     ui.run(
         host="0.0.0.0",
@@ -3105,4 +3134,8 @@ if __name__ == "__main__":
         show=False,
         reload=False, 
         favicon=''
-    )  
+    )
+
+
+if __name__ == "__main__":
+    run()
